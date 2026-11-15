@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v1.3.1)
+"""HEXA CLIP — CardputerZero 用アプリ (v1.4)
 
 スマホやPCから送ったコード・資料を受け取って、本体で使う (fn+V で打ち込む / ~/clip/ に置く)。
 
@@ -42,7 +42,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-VERSION = "1.3.1"
+VERSION = "1.4"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -1030,6 +1030,9 @@ class App:
         self.happy_until = 0.0              # ゴマエビちゃんが喜んでいる時間
         self.status = {"t": 0.0}
         self.home_cache = (None, None)
+        self.desc = ("", 0, LCD_W)
+        self.marq = (None, 0.0)                 # 説明文を流し始めた時刻
+        self.animating = False
         self.font_b, _ = find_font(19, bold=True)
         self.font_bs, _ = find_font(11, bold=True)
         self.font_t, _ = find_font(10)
@@ -1134,8 +1137,10 @@ class App:
     # ---- ホーム (ハニカム)
     HEX_R = 32                                                # 六角形の大きさ (中心から角まで)
     HOME_POS = [(34, 60), (94, 60), (64, 112), (124, 112)]    # 2x2 のハニカム
-    HOME_DESC = {M_HIST: "受け取ったもの", M_QR: "スマホ・PCと",
-                 M_CLIP: "文字・QR (おまけ)", M_SET: "受信・fn+V・カメラ"}
+    HOME_DESC = {M_HIST: "受け取ったもの", M_QR: "スマホ・PCとつなぐ (QRを読むだけ)",
+                 M_CLIP: "本体カメラで文字・QRを読む (おまけ)", M_SET: "受信の知らせ・fn+V・カメラ"}
+    MARQ_WAIT, MARQ_SPEED, MARQ_END = 0.8, 40, 1.0     # 横に流す: 待つ秒 / 速さ(px/秒) / 最後で止まる秒
+    DESC_BOX = (50, 67)                                  # 説明文の行 (上下のy)
 
     def status_text(self):
         """右上: Wi-Fi (IPの末尾) と電池。15秒ごとに取り直す"""
@@ -1161,6 +1166,7 @@ class App:
                self.status_text(), self.cam is None, self.items is None)
         if self.home_cache[0] == key:
             img = self.home_cache[1].copy()
+            self.draw_desc(img)
             return self.chrome(img, self.home_hint())
         img = self.honey.copy()
         d = ImageDraw.Draw(img)
@@ -1193,12 +1199,12 @@ class App:
         d.text((x0, 22), SCREEN_NAMES[sel], fill=FG, font=self.font_b)
         desc = self.HOME_DESC[sel]
         if sel == M_HIST and self.items is not None:
-            desc = f"{len(self.items)}件"
+            desc = f"{len(self.items)}件  {desc}"
         if sel == M_CLIP and self.cam is None:
-            desc = "カメラなし"
+            desc = "カメラが見つかりません"
         if self.items is None:
             desc = "HEXA CLIP が停止中"
-        d.text((x0, 50), self.ellipsize(desc, right - x0), fill=SUB, font=self.font_s)
+        self.desc = (desc, x0, right)           # 説明文はキャッシュの外で描く (横に流すため)
         d.line((x0, 68, right, 68), fill=(44, 50, 64))
         d.text((x0, 72), "fn+V で貼れる", fill=ACC, font=self.font_t)
         d.rounded_rectangle((x0, 87, max(x0 + 60, right), 117), 4, fill=(18, 22, 30), outline=(44, 50, 64))
@@ -1215,7 +1221,30 @@ class App:
             m = self.mascot["happy" if happy else "idle"]
             img.paste(m, (LCD_W - 3 - (mw + m.width) // 2, LCD_H - BOT_H - m.height - 1), m)
         self.home_cache = (key, img.copy())
+        self.draw_desc(img)
         return self.chrome(img, self.home_hint())
+
+    def draw_desc(self, img):
+        """説明文。収まらない時は、選んでから一度だけ右へ流して先頭に戻る"""
+        desc, x0, right = self.desc
+        w, avail = self.font_s.getlength(desc), right - x0
+        if self.marq[0] != (self.home_sel, desc):
+            self.marq = ((self.home_sel, desc), time.time())
+        off, self.animating = 0, False
+        if w > avail:
+            travel = w - avail + 4
+            dt = time.time() - self.marq[1] - self.MARQ_WAIT
+            dur = travel / self.MARQ_SPEED
+            if dt < 0:
+                self.animating = True            # 動き出すのを待っている
+            elif dt < dur:
+                off, self.animating = int(dt * self.MARQ_SPEED), True
+            elif dt < dur + self.MARQ_END:
+                off, self.animating = int(travel), True
+        y0, y1 = self.DESC_BOX
+        strip = img.crop((x0, y0, right, y1))
+        ImageDraw.Draw(strip).text((-off, 0), desc, fill=SUB, font=self.font_s)
+        img.paste(strip, (x0, y0))
 
     def home_hint(self):
         A = self.AR
@@ -1974,7 +2003,8 @@ class App:
             frames += 1
 
             live = self.mode == M_CLIP and self.cam is not None
-            for kind, val in nav(self.keys.poll(0.0 if live else 0.25)):
+            wait = 0.0 if live else (0.04 if self.mode == M_HOME and self.animating else 0.25)
+            for kind, val in nav(self.keys.poll(wait)):
                 if kind == "ACT" and val == "ESC" and self.mode == M_HIST and self.query:
                     self.query, self.sel, self.top = "", 0, 0      # まず検索を解除
                     self.refresh_items()
