@@ -32,7 +32,7 @@ PIN_PATH = os.path.join(DATA_DIR, "pin")
 MAX_TEXT = 256 * 1024          # 1件の上限 256KB
 MAX_ITEMS = 500                # 履歴の上限
 MAX_IMAGE = 12 * 1024 * 1024   # スマホ撮影の画像 12MB
-OCR_LANGS = {"jpn", "eng", "jpn+eng"}
+OCR_LANGS = {"jpn", "eng", "jpn+eng", "code"}
 OCR_MAX_SIDE = 3000            # これより大きい画像は縮小してから読む
 SESSION_DAYS = 30
 LOCAL_ADDRS = {"127.0.0.1", "::1"}
@@ -175,7 +175,7 @@ _OCR_LOCK = threading.Lock()       # CM0 は非力なので1枚ずつ
 
 
 def ocr_image(data, lang):
-    """画像(バイト列) → (テキスト, 秒)。前処理と読み取りは本体アプリ(ocr_cam)と同じ"""
+    """画像(バイト列) → (テキスト, 自信のない範囲, 秒)。前処理と読み取りは本体アプリ(ocr_cam)と同じ"""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from io import BytesIO
     from PIL import Image, ImageOps
@@ -190,13 +190,13 @@ def ocr_image(data, lang):
         fd, path = tempfile.mkstemp(prefix="hexaclip_ocr_", suffix=".png")
         os.close(fd)
         try:
-            text = ocr_cam.run_ocr(ocr_cam.prepare(img), lang, 6, path=path)
+            text, marks = ocr_cam.run_ocr_ex(ocr_cam.prepare(img), lang, 6, path=path)
         finally:
             try:
                 os.remove(path)
             except OSError:
                 pass
-        return text, time.time() - t0
+        return text, marks, time.time() - t0
 
 
 # ------------------------------------------------------------------ web page
@@ -239,6 +239,8 @@ color:var(--sub);font-size:12px;flex-wrap:wrap}.meta .src{padding:1px 6px;border
 background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:10px;margin:12px 0}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--acc);color:#04130a;
 padding:8px 16px;border-radius:20px;font-weight:600;opacity:0;transition:.2s;pointer-events:none;z-index:9}
+#unsure{font-size:12px;color:var(--sub);margin:6px 0 0;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+#unsure button{padding:2px 8px;font-size:13px;color:#ffaa3c;border-color:#7a5320;background:#2a2116}
 #toast.on{opacity:1}.err{color:#ff6b6b;min-height:1.5em}.empty{color:var(--sub);text-align:center;padding:30px}
 </style></head><body>
 <div id="login" hidden>
@@ -254,7 +256,8 @@ padding:8px 16px;border-radius:20px;font-weight:600;opacity:0;transition:.2s;poi
   <div class="row">
     <button class="cam grow" id="camBtn" onclick="pick()">撮影して文字を読む</button>
     <select id="lang" aria-label="OCRの言語">
-      <option value="jpn">日本語</option><option value="jpn+eng">日+英</option><option value="eng">英語/コード</option>
+      <option value="jpn">日本語</option><option value="jpn+eng">日+英</option><option value="eng">英語</option>
+      <option value="code">コード</option>
     </select>
   </div>
   <input type="file" id="file" accept="image/*" capture="environment" hidden>
@@ -270,6 +273,7 @@ padding:8px 16px;border-radius:20px;font-weight:600;opacity:0;transition:.2s;poi
   <div id="editbar" hidden><span id="edlabel"></span><span class="sp"></span>
     <button onclick="endEdit(true)">編集をやめる</button></div>
   <textarea id="t" placeholder="ここに貼り付けて「CPZへ送る」→ 本体で fn+V / czclip paste"></textarea>
+  <div id="unsure" hidden></div>
   <div class="row"><button class="grow pri" id="sendBtn" onclick="send()">CPZへ送る</button>
   <button id="reBtn" onclick="reopen()" hidden>範囲を選び直す</button>
   <button onclick="clr()">クリア</button></div>
@@ -307,8 +311,8 @@ async function poll(){try{const r=await api('/api/ping');online(true);if(r.rev!=
 async function send(){const v=$('t').value;if(!v.trim())return;const b=$('sendBtn');b.disabled=true;
  try{if(editing){await api('/api/items/'+editing,{method:'PUT',body:JSON.stringify({text:v})});toast('保存しました')}
  else{await api('/api/items',{method:'POST',body:JSON.stringify({text:v,source:lastOcr?'cam':'web'})});toast('送りました')}
- $('t').value='';lastOcr=false;endEdit(false);load()}catch(e){toast('失敗')}finally{b.disabled=false}}
-function clr(){$('t').value='';lastOcr=false;endEdit(false)}
+ $('t').value='';lastOcr=false;unsure=[];showUnsure();endEdit(false);load()}catch(e){toast('失敗')}finally{b.disabled=false}}
+function clr(){$('t').value='';lastOcr=false;unsure=[];showUnsure();endEdit(false)}
 async function del(id){if(!confirm('#'+id+' を削除しますか?'))return;
  try{await api('/api/items/'+id,{method:'DELETE'})}catch(e){}load()}
 async function toTop(id){try{await api('/api/items/'+id+'/top',{method:'POST',body:'{}'});
@@ -325,7 +329,12 @@ function cp(id){const s=items.find(i=>i.id===id).text;
  try{document.execCommand('copy');toast('コピーしました')}catch(e){toast('コピー失敗')}ta.remove()}}
 
 // ---- 撮影 → 範囲選択 → 本体でOCR
-const MAXSRC=3000,MAXFULL=2000;let lastOcr=false;
+const MAXSRC=3000,MAXFULL=2000;let lastOcr=false,unsure=[];
+// 自信のない語: タップで入力欄のその場所を選択 (位置がずれていたら同じ語を探す)
+function showUnsure(){const u=$('unsure');u.hidden=!unsure.length;if(!unsure.length)return;
+ u.innerHTML='自信なし:'+unsure.map((x,i)=>`<button onclick="jump(${i})">${esc(x.w)}</button>`).join('')}
+function jump(i){const t=$('t'),x=unsure[i];let s=t.value.substr(x.s,x.w.length)===x.w?x.s:t.value.indexOf(x.w);
+ if(s<0){unsure.splice(i,1);showUnsure();return}t.focus();t.setSelectionRange(s,s+x.w.length)}
 try{$('lang').value=localStorage.getItem('hc_lang')||'jpn'}catch(e){}
 $('lang').onchange=()=>{try{localStorage.setItem('hc_lang',$('lang').value)}catch(e){}};
 function pick(){$('file').value='';$('file').click()}
@@ -365,7 +374,9 @@ async function doOcr(){if(!src)return;const b=$('ocrBtn');b.disabled=true;b.text
    credentials:'same-origin',headers:{'Content-Type':'image/jpeg'},body:blob});
   if(r.status==401){show(false);return}const j=await r.json();if(!r.ok)throw j.error||r.status;
   if(!j.text.trim()){toast('文字が見つかりませんでした。範囲を狭めるか撮り直してください',3000);return}
-  if(editing)endEdit(false);const t=$('t');t.value=t.value.trim()?t.value.replace(/\n*$/,'\n')+j.text:j.text;
+  if(editing)endEdit(false);const t=$('t'),off=t.value.trim()?t.value.replace(/\n*$/,'\n').length:0;
+  t.value=off?t.value.replace(/\n*$/,'\n')+j.text:j.text;
+  unsure=(off?unsure:[]).concat((j.marks||[]).map(m=>({s:m[0]+off,w:j.text.slice(m[0],m[1])})));showUnsure();
   lastOcr=true;closeCrop();t.scrollIntoView({behavior:'smooth',block:'center'});
   toast(`読み取りました (${j.elapsed.toFixed(1)}秒) 直して「CPZへ送る」`,2800)}
  catch(e){toast('読み取り失敗: '+e,3000)}finally{b.disabled=false;b.textContent='読み取る'}}
@@ -517,7 +528,7 @@ class Handler(BaseHTTPRequestHandler):
         if lang not in OCR_LANGS:
             return self.send_json({"error": "lang"}, 400)
         try:
-            text, dt = ocr_image(data, lang)
+            text, marks, dt = ocr_image(data, lang)
         except ImportError as e:
             return self.send_json({"error": f"OCRの準備ができていません ({e.name})"}, 503)
         except FileNotFoundError:
@@ -528,7 +539,7 @@ class Handler(BaseHTTPRequestHandler):
             print("ocr failed:", repr(e), flush=True)
             return self.send_json({"error": f"読み取れない画像です ({type(e).__name__})"}, 400)
         print(f"ocr {lang} {len(data)//1024}KB {dt:.1f}s {len(text)}chars", flush=True)
-        return self.send_json({"text": text, "elapsed": dt})
+        return self.send_json({"text": text, "elapsed": dt, "marks": marks})
 
     def _do_PUT(self):
         if not self.authed():

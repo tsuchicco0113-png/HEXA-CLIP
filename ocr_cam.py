@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v0.6.2)
+"""HEXA CLIP — CardputerZero 用アプリ (v0.7)
 
 4つのモードを上のタブで切り替える:
   1 クリップ : カメラで文字を読み取り → 修正 → HEXA CLIPへ送る
@@ -37,7 +37,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.6.2"
+VERSION = "0.7"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -71,8 +71,11 @@ def chown_user(*paths):
 
 # ---------------------------------------------------------------- settings
 SETTING_DEFS = [
-    ("lang", "OCRの言語", ["jpn", "jpn+eng", "eng"], ["日本語", "日本語+英語", "英語"]),
+    ("lang", "OCRの言語", ["jpn", "jpn+eng", "eng", "code"],
+     ["日本語", "日本語+英語", "英語", "コード(空白保持)"]),
     ("hires", "高精細撮影", [True, False], ["ON (小さい文字向き)", "OFF (速い)"]),
+    ("burst", "連写して選ぶ", [3, 1, 5], ["3枚", "1枚 (速い)", "5枚"]),
+    ("low_conf", "自信のない文字", ["mark", "drop"], ["色付きで残す", "消す"]),
     ("zoom", "起動時のズーム", [0, 1, 2], ["x1", "x2", "x3"]),
     ("auto_show", "受信したら表示", [False, True], ["OFF (通知のみ)", "ON (本文を開く)"]),
     ("paste_erase", "fn+Vで入るVを消す", [True, False], ["ON", "OFF"]),
@@ -382,33 +385,66 @@ def prepare(img):
     return ImageOps.autocontrast(img, cutoff=1)
 
 
-def capture_crop(cam, cw, hires=True):
-    """枠内を切り出す。hires=True なら全画素モードに切り替えて撮る"""
-    y, W, H = None, MAIN_W, MAIN_H
-    if hires and STILL_CFG is not None:
-        try:
-            y = cam.switch_mode_and_capture_array(STILL_CFG, "main")
-            W, H = FULL_W, FULL_H
-        except Exception as e:
-            print("hires capture failed, fallback:", e)
-            y = None
-    if y is None:
-        y = cam.capture_array("main")
-        W, H = MAIN_W, MAIN_H
+def capture_crop(cam, cw, hires=True, burst=3, settle=0.3):
+    """枠内を切り出す。hires=True なら全画素モードに切り替えて撮る
+
+    ENTER を押した揺れが収まるまで settle 秒待ち、burst 枚撮って一番シャープな1枚を使う。
+    戻り値: (前処理した画像, 情報文字列)"""
+    time.sleep(settle)
     f = box_frac(cw)
-    x0, y0, x1, y1 = int(f[0] * W), int(f[1] * H), int(f[2] * W), int(f[3] * H)
-    img = Image.fromarray(np.ascontiguousarray(y[:H, :W][y0:y1, x0:x1]))
+
+    def crop(y, W, H):
+        x0, y0, x1, y1 = int(f[0] * W), int(f[1] * H), int(f[2] * W), int(f[3] * H)
+        return np.ascontiguousarray(y[:H, :W][y0:y1, x0:x1])
+
+    burst = max(1, int(burst))
+    frames = []
+    if hires and STILL_CFG is not None:
+        prev = getattr(cam, "camera_config", None)
+        try:
+            if burst == 1 or prev is None:
+                frames.append(crop(cam.switch_mode_and_capture_array(STILL_CFG, "main"),
+                                   FULL_W, FULL_H))
+            else:
+                cam.switch_mode(STILL_CFG)
+                try:
+                    for _ in range(burst):
+                        frames.append(crop(cam.capture_array("main"), FULL_W, FULL_H))
+                finally:
+                    cam.switch_mode(prev)       # プレビューに戻す
+        except Exception as e:
+            print("hires capture failed, fallback:", e, flush=True)
+    if not frames:
+        for _ in range(burst):
+            frames.append(crop(cam.capture_array("main"), MAIN_W, MAIN_H))
+    scores = [sharpness(fr) for fr in frames]
+    best = int(np.argmax(scores))
+    img = Image.fromarray(frames[best])
     img.save("/tmp/ocr_cam_raw.png")
-    return prepare(img)
+    info = f"{best + 1}/{len(frames)}枚目" if len(frames) > 1 else ""
+    return prepare(img), info
+
+
+OCR_LANGS = {"jpn": "jpn", "jpn+eng": "jpn+eng", "eng": "eng", "code": "eng"}
 
 
 def run_ocr(img, lang, psm, min_conf=60.0, path="/tmp/ocr_cam_crop.png", timeout=90):
-    """TSVで単語ごとの信頼度を取り、低いもの(ノイズ)を捨てる
+    """文字列だけ返す (信頼度の低い単語は捨てる)"""
+    return run_ocr_ex(img, lang, psm, min_conf, keep_low=None, path=path, timeout=timeout)[0]
 
+
+def run_ocr_ex(img, lang, psm, min_conf=60.0, keep_low=30.0, path="/tmp/ocr_cam_crop.png",
+               timeout=90):
+    """TSVで単語ごとの信頼度を取る → (テキスト, 自信のない範囲 [(start, end), ...])
+
+    min_conf 未満の単語: keep_low 以上なら「自信なし」として残し範囲を返す。
+                         keep_low=None または keep_low 未満なら捨てる (反射などのノイズ)
+    lang: jpn / jpn+eng / eng / code (英語 + 単語間の空白を位置から復元)
     path: 一時ファイル。czclipd (スマホ撮影のOCR) からは別名で呼ぶ
           (sudo で動いた本体アプリの /tmp ファイルを上書きできず失敗するのを防ぐ)"""
     img.save(path)
-    r = subprocess.run(["tesseract", path, "-", "-l", lang, "--psm", str(psm), "tsv"],
+    r = subprocess.run(["tesseract", path, "-", "-l", OCR_LANGS.get(lang, lang),
+                        "--psm", str(psm), "tsv"],
                        capture_output=True, text=True, timeout=timeout)
     lines, order = {}, []
     for row in r.stdout.splitlines()[1:]:
@@ -416,45 +452,57 @@ def run_ocr(img, lang, psm, min_conf=60.0, path="/tmp/ocr_cam_crop.png", timeout
         if len(c) < 12 or not c[11].strip():
             continue
         try:
-            if float(c[10]) < min_conf:
-                continue
+            conf = float(c[10])
             left, width = int(c[6]), int(c[8])
         except ValueError:
+            continue
+        low = conf < min_conf
+        if low and (keep_low is None or conf < keep_low):
             continue
         key = (c[2], c[3], c[4])
         if key not in lines:
             lines[key] = []
             order.append(key)
-        lines[key].append((c[11], left, width))
-    return join_lines([lines[k] for k in order])
+        lines[key].append((c[11], left, width, low))
+    return join_lines([lines[k] for k in order], exact_spaces=(lang == "code"))
 
 
 QUOTES = str.maketrans({"\u201c": '"', "\u201d": '"', "\u201e": '"', "\u2033": '"',
                         "\u2018": "'", "\u2019": "'", "\u2032": "'", "\u00b4": "'"})
 
 
-def join_lines(lines):
-    """単語 [(文字, left, width)] の行リスト → テキスト
+def join_lines(lines, exact_spaces=False):
+    """単語 [(文字, left, width[, low])] の行リスト → (テキスト, 自信のない範囲)
 
     - 行頭の位置からインデントを復元する (コードの字下げが消えないように)
+    - exact_spaces: 単語間の空白の数も位置から復元する (コードの桁揃えなど)
     - “ ” ‘ ’ を " ' にそろえる (コードで使えない & fn+V で打てないため)
     """
     if not lines:
-        return ""
+        return "", []
     # 半角1文字の幅: ASCIIだけの単語から推定
-    ws = [(w, wd) for ln in lines for w, _, wd in ln if w.isascii() and len(w) >= 2]
+    ws = [(w[0], w[2]) for ln in lines for w in ln if w[0].isascii() and len(w[0]) >= 2]
     cw = sum(wd for _, wd in ws) / max(1, sum(len(w) for w, _ in ws)) if ws else 0
     base = min(ln[0][1] for ln in lines)
-    out = []
+    out, marks, pos = [], [], 0
     for ln in lines:
-        s = ln[0][0]
-        for w, _, _ in ln[1:]:
-            s += (" " if s[-1:].isascii() and w[:1].isascii() else "") + w
         indent = int(round((ln[0][1] - base) / cw)) if cw else 0
-        if 1 <= indent <= 40:
-            s = " " * indent + s
+        s = " " * indent if 1 <= indent <= 40 else ""
+        prev = None
+        for w in ln:
+            text, left, width = w[0], w[1], w[2]
+            if prev is not None:
+                if exact_spaces and cw:
+                    s += " " * max(1, min(40, int(round((left - prev[1] - prev[2]) / cw))))
+                elif s[-1:].isascii() and text[:1].isascii():
+                    s += " "
+            if len(w) > 3 and w[3]:
+                marks.append((pos + len(s), pos + len(s) + len(text)))
+            s += text
+            prev = w
         out.append(s.translate(QUOTES))
-    return "\n".join(out)
+        pos += len(s) + 1
+    return "\n".join(out), marks
 
 
 # ---------------------------------------------------------------- clip API
@@ -545,15 +593,42 @@ def _layout(text, font, width):
 class Editor:
     LINE_H = 20
     TOP, BOTTOM = 20, 16
+    LOW = (255, 170, 60)                     # 自信のない文字の色
 
-    def __init__(self, text, font, font_s, elapsed):
+    def __init__(self, text, font, font_s, elapsed, marks=None):
         self.text, self.cur = text, len(text)
+        self.orig = text
         self.font, self.font_s = font, font_s
         self.elapsed = elapsed
         self.title = f"編集  OCR {elapsed:.1f}s" if elapsed else "編集"
         self.scroll = 0
         self.width = LCD_W - 10
         self.rows = (LCD_H - self.TOP - self.BOTTOM) // self.LINE_H
+        self.marks = [list(m) for m in (marks or []) if 0 <= m[0] < m[1] <= len(text)]
+        self.armed = False                   # ESC をもう一度押すと破棄
+
+    # ---- 自信のない範囲を編集に合わせてずらす (触った範囲は「確認済み」として消す)
+    def _ins(self, p):
+        keep = []
+        for m in self.marks:
+            if m[0] >= p:
+                m[0] += 1
+                m[1] += 1
+            elif m[0] < p < m[1]:
+                continue
+            keep.append(m)
+        self.marks = keep
+
+    def _del(self, p):
+        keep = []
+        for m in self.marks:
+            if m[0] <= p < m[1]:
+                continue
+            if m[0] > p:
+                m[0] -= 1
+                m[1] -= 1
+            keep.append(m)
+        self.marks = keep
 
     def _pos(self, lines):
         for n, (s, e) in enumerate(lines):
@@ -573,17 +648,26 @@ class Editor:
 
     def handle(self, kind, val):
         """戻り値: None(継続) / 'SEND' / 'CANCEL'"""
+        if self.armed:
+            self.armed = False
+            if kind == "ACT" and val == "ESC":
+                return "CANCEL"
+            return None                      # 他のキーは「やめる」だけ (入力はしない)
         t = self.text
         if kind == "CHAR":
+            self._ins(self.cur)
             self.text = t[:self.cur] + val + t[self.cur:]
             self.cur += 1
         elif val == "TAB":
+            self._ins(self.cur)
             self.text = t[:self.cur] + "\n" + t[self.cur:]
             self.cur += 1
         elif val == "BS" and self.cur > 0:
+            self._del(self.cur - 1)
             self.text = t[:self.cur - 1] + t[self.cur:]
             self.cur -= 1
         elif val == "DEL" and self.cur < len(t):
+            self._del(self.cur)
             self.text = t[:self.cur] + t[self.cur + 1:]
         elif val == "LEFT":
             self.cur = max(0, self.cur - 1)
@@ -605,15 +689,35 @@ class Editor:
         elif val == "ENTER":
             return "SEND"
         elif val == "ESC":
-            return "CANCEL"
+            if self.text == self.orig and not self.elapsed:
+                return "CANCEL"              # 何も変えていない (履歴からの編集)
+            self.armed = True
         return None
+
+    def _segments(self, s, e):
+        """行 [s, e) を (文字列, 自信なしか) に分ける"""
+        cuts = {s, e}
+        for a, b in self.marks:
+            if a < e and b > s:
+                cuts.update((max(a, s), min(b, e)))
+        pts = sorted(cuts)
+        out = []
+        for a, b in zip(pts, pts[1:]):
+            low = any(m[0] <= a and b <= m[1] for m in self.marks)
+            out.append((self.text[a:b], low))
+        return out
 
     def render(self):
         img = Image.new("RGB", (LCD_W, LCD_H), (14, 16, 22))
         d = ImageDraw.Draw(img)
-        d.rectangle((0, 0, LCD_W, 17), fill=(0, 90, 60))
-        d.text((4, 1), f"{self.title}  {len(self.text)}文字",
-               fill=(255, 255, 255), font=self.font_s)
+        d.rectangle((0, 0, LCD_W, 17), fill=(120, 30, 30) if self.armed else (0, 90, 60))
+        if self.armed:
+            title = "もう一度ESCで破棄 / 他のキーで戻る"
+        else:
+            title = f"{self.title}  {len(self.text)}文字"
+            if self.marks:
+                title += f"  要確認{len(self.marks)}"
+        d.text((4, 1), title, fill=(255, 255, 255), font=self.font_s)
         lines = layout(self.text, self.font, self.width)
         n, _ = self._pos(lines)
         if n < self.scroll:
@@ -626,7 +730,17 @@ class Editor:
                 break
             s, e = lines[li]
             y = self.TOP + r * self.LINE_H
-            d.text((5, y), self.text[s:e], fill=(235, 238, 245), font=self.font)
+            if self.marks:
+                x = 5.0
+                for seg, low in self._segments(s, e):
+                    w = self.font.getlength(seg)
+                    if low:
+                        d.line((x, y + self.LINE_H - 2, x + w, y + self.LINE_H - 2),
+                               fill=self.LOW, width=1)
+                    d.text((x, y), seg, fill=self.LOW if low else (235, 238, 245), font=self.font)
+                    x += w
+            else:
+                d.text((5, y), self.text[s:e], fill=(235, 238, 245), font=self.font)
             if li == n:
                 cx = 5 + int(self.font.getlength(self.text[s:self.cur]))
                 d.rectangle((cx, y + 1, cx + 1, y + self.LINE_H - 2), fill=(47, 214, 123))
@@ -638,8 +752,9 @@ class Editor:
             by = self.TOP + (h - bh) * self.scroll // max(1, len(lines) - self.rows)
             d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
         d.rectangle((0, LCD_H - self.BOTTOM, LCD_W, LCD_H), fill=(0, 0, 0))
-        d.text((4, LCD_H - 15), "ENTER:送る ESC:破棄 TAB:改行 fn+FXZC:移動",
-               fill=(200, 200, 200), font=self.font_s)
+        hint = ("橙=自信なし ENTER:送る ESC:破棄 TAB:改行" if self.marks
+                else "ENTER:送る ESC:破棄 TAB:改行 fn+FXZC:移動")
+        d.text((4, LCD_H - 15), hint, fill=(200, 200, 200), font=self.font_s)
         return img
 
 
@@ -746,8 +861,9 @@ class App:
         self.message("クリップ", "読み取り中...")
         t0 = time.time()
         try:
-            text = run_ocr(capture_crop(self.cam, self.pv.cw, self.st["hires"]),
-                           self.st["lang"], self.args.psm)
+            img, info = capture_crop(self.cam, self.pv.cw, self.st["hires"], self.st["burst"])
+            text, marks = run_ocr_ex(img, self.st["lang"], self.args.psm,
+                                     keep_low=30.0 if self.st["low_conf"] == "mark" else None)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -756,8 +872,8 @@ class App:
             self.keys.flush(0.2)
             return
         dt = time.time() - t0
-        print(f"----- OCR ({dt:.1f}s)\n{text}\n-----", flush=True)
-        out = self.run_editor(text, dt)
+        print(f"----- OCR ({dt:.1f}s {info})\n{text}\n-----", flush=True)
+        out = self.run_editor(text, dt, marks)
         if out and out.strip():
             self.say(send_clip(out, "ocr"))
             it = clip_items(1)
@@ -779,9 +895,9 @@ class App:
         except Exception as e:
             print("camera restart failed:", e, flush=True)
 
-    def run_editor(self, text, elapsed=0.0):
+    def run_editor(self, text, elapsed=0.0, marks=None):
         """編集画面(モーダル)。送る→文字列 / 破棄→None"""
-        ed = Editor(text, self.font, self.font_s, elapsed)
+        ed = Editor(text, self.font, self.font_s, elapsed, marks)
         self.keys.flush(0.2)
         while True:
             self.fb.show(ed.render())
@@ -984,20 +1100,33 @@ class App:
         img = self.canvas()
         d = ImageDraw.Draw(img)
         A = self.AR
-        for i, (key, label, vals, names) in enumerate(SETTING_DEFS):
-            y = TOP_H + 3 + i * 26
+        rh = 22
+        rows = (LCD_H - TOP_H - BOT_H - 2) // rh
+        top = min(max(0, self.set_sel - rows + 1), max(0, len(SETTING_DEFS) - rows))
+        top = min(top, self.set_sel)
+        for r in range(rows):
+            i = top + r
+            if i >= len(SETTING_DEFS):
+                break
+            key, label, vals, names = SETTING_DEFS[i]
+            y = TOP_H + 2 + r * rh
             on = i == self.set_sel
             if on:
-                d.rectangle((0, y, LCD_W, y + 23), fill=(34, 48, 58))
-                d.rectangle((0, y, 2, y + 23), fill=ACC)
-            d.text((8, y + 5), label, fill=FG, font=self.font_s)
+                d.rectangle((0, y, LCD_W - 5, y + rh - 2), fill=(34, 48, 58))
+                d.rectangle((0, y, 2, y + rh - 2), fill=ACC)
+            d.text((8, y + 4), label, fill=FG, font=self.font_s)
             try:
                 name = names[vals.index(self.st[key])]
             except ValueError:
                 name = str(self.st[key])
             txt = f"{A['l']} {name} {A['r']}" if on else name
-            d.text((LCD_W - 8 - self.font_s.getlength(txt), y + 5), txt,
+            d.text((LCD_W - 10 - self.font_s.getlength(txt), y + 4), txt,
                    fill=ACC if on else SUB, font=self.font_s)
+        if len(SETTING_DEFS) > rows:
+            h = rows * rh
+            bh = max(8, h * rows // len(SETTING_DEFS))
+            by = TOP_H + 2 + (h - bh) * top // max(1, len(SETTING_DEFS) - rows)
+            d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
         return self.chrome(img, f"{A['u']}{A['d']}:選ぶ {A['l']}{A['r']}:変える(すぐ保存) ESC:終了")
 
     def change_setting(self, step):
