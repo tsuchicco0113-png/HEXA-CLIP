@@ -37,7 +37,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.5"
+VERSION = "0.6"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -74,6 +74,7 @@ SETTING_DEFS = [
     ("hires", "高精細撮影", [True, False], ["ON (小さい文字向き)", "OFF (速い)"]),
     ("zoom", "起動時のズーム", [0, 1, 2], ["x1", "x2", "x3"]),
     ("auto_show", "受信したら表示", [False, True], ["OFF (通知のみ)", "ON (本文を開く)"]),
+    ("paste_erase", "fn+V貼付で1文字消す", [False, True], ["OFF", "ON (vが入る時)"]),
 ]
 
 
@@ -873,7 +874,7 @@ class App:
         d = ImageDraw.Draw(img)
         A = self.AR
         for i, (key, label, vals, names) in enumerate(SETTING_DEFS):
-            y = TOP_H + 4 + i * 26
+            y = TOP_H + 3 + i * 26
             on = i == self.set_sel
             if on:
                 d.rectangle((0, y, LCD_W, y + 23), fill=(34, 48, 58))
@@ -886,7 +887,6 @@ class App:
             txt = f"{A['l']} {name} {A['r']}" if on else name
             d.text((LCD_W - 8 - self.font_s.getlength(txt), y + 5), txt,
                    fill=ACC if on else SUB, font=self.font_s)
-        d.text((8, LCD_H - BOT_H - 16), f"HEXA CLIP v{VERSION}", fill=(90, 98, 115), font=self.font_s)
         return self.chrome(img, f"{A['u']}{A['d']}:選ぶ {A['l']}{A['r']}:変える(すぐ保存) ESC:終了")
 
     def change_setting(self, step):

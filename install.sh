@@ -13,7 +13,7 @@ echo "== packages"
 sudo apt-get install -y python3-pil python3-qrcode tesseract-ocr tesseract-ocr-jpn tesseract-ocr-eng >/dev/null
 
 echo "== files"
-chmod +x "$DIR/czclip" "$DIR/czclipd.py" "$DIR/ocr_cam.py" "$DIR/hexaclip-ocr"
+chmod +x "$DIR/czclip" "$DIR/czclipd.py" "$DIR/czpasted.py" "$DIR/ocr_cam.py" "$DIR/hexaclip-ocr"
 sudo ln -sf "$DIR/czclip" /usr/local/bin/czclip
 sudo ln -sf "$DIR/hexaclip-ocr" /usr/local/bin/hexaclip-ocr
 
@@ -45,6 +45,24 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --now hexaclip
 sudo systemctl restart hexaclip
+
+echo "== paste service (fn+V で貼り付け)"
+sudo tee /etc/systemd/system/hexaclip-paste.service >/dev/null <<EOF
+[Unit]
+Description=HEXA CLIP paste hotkey (fn+V)
+After=hexaclip.service
+
+[Service]
+ExecStart=/usr/bin/python3 $DIR/czpasted.py --settings /home/$U/.config/hexaclip/settings.json
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable hexaclip-paste >/dev/null 2>&1
+sudo systemctl restart hexaclip-paste
 
 if [ -d "$APPL/applications" ]; then
   echo "== launcher (APPLaunch)"

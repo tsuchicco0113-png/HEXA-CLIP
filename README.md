@@ -21,6 +21,7 @@ M5Stack **CardputerZero** 用の共有クリップボード + カメラOCR。
 | `czclipd.py` | 常駐サーバー。SQLite に履歴保存、`:8080` でスマホ用Web画面 (PIN認証)。標準ライブラリのみ |
 | `czclip` | CLI (`paste` / `push` / `list` / `get` / `rm` / `pin` / `logout-all`) |
 | `ocr_cam.py` | 本体アプリ (クリップ / 履歴 / QR / 設定) |
+| `czpasted.py` | fn+V で最新のクリップをキー入力として貼り付ける常駐プログラム |
 | `hexaclip-ocr` | OCRアプリの起動スクリプト (ランチャーから起動時は `~/.local/share/hexaclip/ocr.log` にログ) |
 | `make_icon.py` | ランチャー用アイコン生成 |
 | `install.sh` | 依存パッケージ導入、`czclip` / `hexaclip-ocr` コマンド、systemd `hexaclip.service`、ホーム画面への登録 |
@@ -76,6 +77,17 @@ hexaclip-ocr               # ホーム画面のアイコンと同じ
 - 起動中はランチャー(APPLaunch)を一時停止し、自動ロック/スリープを防ぎます (`--no-pause` で無効)。
   万一ランチャーが固まったままになったら `sudo pkill -CONT -f APPLaunch`
 - キーが効かないとき: `hexaclip-ocr --debug-keys` でコードを確認、`--keys keys.json` で上書き
+
+### fn+V で貼り付け (実験的)
+
+本体のどのアプリでも、**fn を押しながら V** で、HEXA CLIP の最新の内容をキー入力として打ち込みます
+(`czpasted.py` / `hexaclip-paste.service`)。
+
+- 打てるのは英数字と記号だけ。日本語は飛ばします
+- 改行は ENTER として打たれます (CLIでは1行ずつ実行される)
+- 打ち込み中に `ESC` で中止。最大4000文字
+- 貼り付けの先頭に余計な `v` が入るアプリでは、設定の「fn+V貼付で1文字消す」を ON
+- 止める: `sudo systemctl disable --now hexaclip-paste`
 
 ## セキュリティ
 
