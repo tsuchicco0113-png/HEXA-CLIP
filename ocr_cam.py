@@ -402,12 +402,14 @@ def capture_crop(cam, cw, hires=True):
     return prepare(img)
 
 
-def run_ocr(img, lang, psm, min_conf=60.0):
-    """TSVで単語ごとの信頼度を取り、低いもの(ノイズ)を捨てる"""
-    path = "/tmp/ocr_cam_crop.png"
+def run_ocr(img, lang, psm, min_conf=60.0, path="/tmp/ocr_cam_crop.png", timeout=90):
+    """TSVで単語ごとの信頼度を取り、低いもの(ノイズ)を捨てる
+
+    path: 一時ファイル。czclipd (スマホ撮影のOCR) からは別名で呼ぶ
+          (sudo で動いた本体アプリの /tmp ファイルを上書きできず失敗するのを防ぐ)"""
     img.save(path)
     r = subprocess.run(["tesseract", path, "-", "-l", lang, "--psm", str(psm), "tsv"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, timeout=timeout)
     lines, order = {}, []
     for row in r.stdout.splitlines()[1:]:
         c = row.split("\t")
@@ -416,19 +418,42 @@ def run_ocr(img, lang, psm, min_conf=60.0):
         try:
             if float(c[10]) < min_conf:
                 continue
+            left, width = int(c[6]), int(c[8])
         except ValueError:
             continue
         key = (c[2], c[3], c[4])
         if key not in lines:
             lines[key] = []
             order.append(key)
-        lines[key].append(c[11])
+        lines[key].append((c[11], left, width))
+    return join_lines([lines[k] for k in order])
+
+
+QUOTES = str.maketrans({"\u201c": '"', "\u201d": '"', "\u201e": '"', "\u2033": '"',
+                        "\u2018": "'", "\u2019": "'", "\u2032": "'", "\u00b4": "'"})
+
+
+def join_lines(lines):
+    """単語 [(文字, left, width)] の行リスト → テキスト
+
+    - 行頭の位置からインデントを復元する (コードの字下げが消えないように)
+    - “ ” ‘ ’ を " ' にそろえる (コードで使えない & fn+V で打てないため)
+    """
+    if not lines:
+        return ""
+    # 半角1文字の幅: ASCIIだけの単語から推定
+    ws = [(w, wd) for ln in lines for w, _, wd in ln if w.isascii() and len(w) >= 2]
+    cw = sum(wd for _, wd in ws) / max(1, sum(len(w) for w, _ in ws)) if ws else 0
+    base = min(ln[0][1] for ln in lines)
     out = []
-    for k in order:
-        s = lines[k][0]
-        for w in lines[k][1:]:
+    for ln in lines:
+        s = ln[0][0]
+        for w, _, _ in ln[1:]:
             s += (" " if s[-1:].isascii() and w[:1].isascii() else "") + w
-        out.append(s)
+        indent = int(round((ln[0][1] - base) / cw)) if cw else 0
+        if 1 <= indent <= 40:
+            s = " " * indent + s
+        out.append(s.translate(QUOTES))
     return "\n".join(out)
 
 
@@ -798,7 +823,8 @@ class App:
                 self.top = self.sel
             elif self.sel >= self.top + self.ROWS:
                 self.top = self.sel - self.ROWS + 1
-            colors = {"ocr": (47, 214, 123), "web": (90, 170, 255), "cli": (255, 190, 70)}
+            colors = {"ocr": (47, 214, 123), "web": (90, 170, 255), "cli": (255, 190, 70),
+                      "cam": (200, 140, 255)}
             for r in range(self.ROWS):
                 i = self.top + r
                 if i >= len(self.items):
