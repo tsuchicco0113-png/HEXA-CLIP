@@ -140,7 +140,16 @@ class Keys:
 
     def __init__(self, dev, debug=False, cfg=None):
         self.fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
-        fcntl.ioctl(self.fd, EVIOCGRAB, 1)
+        try:
+            fcntl.ioctl(self.fd, EVIOCGRAB, 1)
+        except OSError as e:
+            os.close(self.fd)
+            if e.errno == 16:               # EBUSY: 別のプログラムがキーボードを独占中
+                raise SystemExit(
+                    "HEXA CLIP はすでに起動しています (キーボードが使用中)。\n"
+                    "本体の画面で ESC を押して終了するか、次を実行してください:\n"
+                    "  pkill -f ocr_cam.py; sleep 1; sudo pkill -CONT -f APPLaunch")
+            raise
         self.debug = debug
         self.held = set()
         self.shift_once = False
