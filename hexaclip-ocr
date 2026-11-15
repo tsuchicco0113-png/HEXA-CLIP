@@ -1,0 +1,19 @@
+#!/bin/sh
+# HEXA CLIP OCR launcher (ランチャー/コマンド共通の入口)
+#   video,input グループに入っていれば sudo なしで起動、
+#   入っていなければ sudo -n (パスワード不要設定がある場合) で起動する
+DIR=$(dirname "$(readlink -f "$0")")
+APP="$DIR/ocr_cam.py"
+LOG="$HOME/.local/share/hexaclip/ocr.log"
+mkdir -p "$(dirname "$LOG")"
+
+if [ -t 1 ]; then
+  OUT=/dev/stdout          # 端末から起動 → 画面に表示
+else
+  OUT="$LOG"               # ランチャーから起動 → ログへ
+fi
+
+if id -nG | tr ' ' '\n' | grep -qx video && id -nG | tr ' ' '\n' | grep -qx input; then
+  exec /usr/bin/python3 "$APP" "$@" >>"$OUT" 2>&1
+fi
+exec sudo -n /usr/bin/python3 "$APP" "$@" >>"$OUT" 2>&1

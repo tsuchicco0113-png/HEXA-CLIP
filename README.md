@@ -21,7 +21,9 @@ M5Stack **CardputerZero** 用の共有クリップボード + カメラOCR。
 | `czclipd.py` | 常駐サーバー。SQLite に履歴保存、`:8080` でスマホ用Web画面 (PIN認証)。標準ライブラリのみ |
 | `czclip` | CLI (`paste` / `push` / `list` / `get` / `rm` / `pin` / `logout-all`) |
 | `ocr_cam.py` | カメラOCRアプリ。プレビュー → OCR → 編集 → クリップへ送信 |
-| `install.sh` | 依存パッケージ導入、`/usr/local/bin/czclip`、systemd `hexaclip.service` |
+| `hexaclip-ocr` | OCRアプリの起動スクリプト (ランチャーから起動時は `~/.local/share/hexaclip/ocr.log` にログ) |
+| `make_icon.py` | ランチャー用アイコン生成 |
+| `install.sh` | 依存パッケージ導入、`czclip` / `hexaclip-ocr` コマンド、systemd `hexaclip.service`、ホーム画面への登録 |
 
 ## インストール (CardputerZero)
 
@@ -31,6 +33,7 @@ cd ~/hexaclip && sh install.sh      # sudo は付けない
 ```
 
 最後に表示される URL を同じWi-Fiのスマホで開き、PIN を入力します (ログインは30日間有効)。
+初回は `sudo reboot` で再起動すると、ホーム画面に **HEXA CLIP** アイコンが追加されます。
 
 ## 使い方
 
@@ -45,8 +48,8 @@ czclip pin                 # 接続URLとPINを表示
 ### カメラOCR
 
 ```bash
-sudo python3 ~/hexaclip/ocr_cam.py            # 日本語 (jpn)
-sudo python3 ~/hexaclip/ocr_cam.py -l jpn+eng
+hexaclip-ocr               # ホーム画面の HEXA CLIP アイコンと同じ
+hexaclip-ocr -l jpn+eng
 ```
 
 | 画面 | キー |
