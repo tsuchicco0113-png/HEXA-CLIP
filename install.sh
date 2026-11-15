@@ -18,6 +18,13 @@ sudo ln -sf "$DIR/pc/hexaclip.py" /usr/local/bin/hexaclip      # PCと同じコ�
 sudo ln -sf "$DIR/czclip" /usr/local/bin/czclip                # 旧コマンド (互換用)
 sudo ln -sf "$DIR/hexaclip-ocr" /usr/local/bin/hexaclip-ocr
 
+echo "== 日本語フォント (画面の字が□にならないか確認)"
+if ! python3 "$DIR/ocr_cam.py" --check-font; then
+  echo "   日本語の字がそろったフォントが無いので fonts-noto-cjk を入れます (少し時間がかかります)"
+  sudo apt-get install -y fonts-noto-cjk >/dev/null
+  python3 "$DIR/ocr_cam.py" --check-font || echo "   ※ それでも見つかりません。表示が□になる場合はお知らせください"
+fi
+
 echo "== permissions (画面とキーボードを sudo なしで使う)"
 NEED_REBOOT=0
 for g in video input; do

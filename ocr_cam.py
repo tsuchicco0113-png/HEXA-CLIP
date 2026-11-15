@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v1.3)
+"""HEXA CLIP — CardputerZero 用アプリ (v1.3.1)
 
 スマホやPCから送ったコード・資料を受け取って、本体で使う (fn+V で打ち込む / ~/clip/ に置く)。
 
@@ -42,7 +42,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-VERSION = "1.3"
+VERSION = "1.3.1"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -297,17 +297,46 @@ class FrameBuffer:
         self.show(Image.new("RGB", (LCD_W, LCD_H)))
 
 
-def find_font(size, bold=False):
-    """日本語フォントを探す(細すぎるウェイトは後回し)。bold=True なら太いウェイトを優先"""
+# 画面に出す字。ここに□(豆腐)が出ないフォントだけを使う
+# (中国語向けのフォントは「歴・続・設・図」など日本の字体の漢字が無いことがある)
+JP_TEST = "履歴接続設定受信貼付送新着件削除保存実行編集読取済本体アプリ戻終了検索カメラあいうえおー"
+_FONT_FILE = {}
+
+
+def font_covers(font, text=JP_TEST):
+    """text の字がすべてフォントに入っているか (無い字は .notdef の□と同じ形になる)"""
+    try:
+        nd = font.getmask("\U0010FFFD")
+        nd_key = (nd.size, bytes(nd))
+        for ch in text:
+            m = font.getmask(ch)
+            if m.getbbox() is None or (m.size, bytes(m)) == nd_key:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def font_candidates():
     cands = []
     for p in ["/usr/share/APPLaunch/**/*.tt[fc]", "/usr/share/APPLaunch/**/*.otf",
               "/usr/share/fonts/**/*CJK*", "/usr/share/fonts/**/*[Ii][Pp][Aa]*",
-              "/usr/share/fonts/**/*wqy*", "/usr/share/fonts/**/*Droid*Fallback*"]:
+              "/usr/share/fonts/**/*[Jj][Pp]*", "/usr/share/fonts/**/*wqy*",
+              "/usr/share/fonts/**/*Droid*Fallback*"]:
         cands += glob.glob(p, recursive=True)
+    return sorted(set(cands))
+
+
+def find_font(size, bold=False):
+    """日本語フォントを探す (細すぎるウェイトは後回し)。bold=True なら太いウェイトを優先
+    一度決まったファイルは覚えておき、大きさだけ変えて使う"""
+    f = _FONT_FILE.get(bold)
+    if f:
+        return ImageFont.truetype(f, size), f
 
     def rank(f):
         n = os.path.basename(f).lower()
-        if "serif" in n:
+        if "serif" in n or "mono" in n:
             return 50
         order = (["bold", "85", "heavy", "75", "black", "medium", "65", "regular", "55", "light", "thin"]
                  if bold else
@@ -316,13 +345,15 @@ def find_font(size, bold=False):
             if w in n:
                 return i
         return 5
-    for f in sorted(set(cands), key=rank):
+    for f in sorted(font_candidates(), key=rank):
         try:
             font = ImageFont.truetype(f, size)
-            if font.getlength("あ") > 0:
-                return font, f
         except Exception:
-            pass
+            continue
+        if font_covers(font):
+            _FONT_FILE[bold] = f
+            return font, f
+        print("font skipped (日本語の字が足りない):", f, flush=True)
     return ImageFont.load_default(), None
 
 
@@ -2040,10 +2071,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-l", "--lang", help="OCR言語を一時的に指定 (設定より優先)")
     ap.add_argument("--psm", type=int, default=6)
+    ap.add_argument("--check-font", action="store_true",
+                    help="使う日本語フォントを表示して終了 (見つからなければ終了コード1)")
     ap.add_argument("--debug-keys", action="store_true")
     ap.add_argument("--keys", help="キー割り当てJSON")
     ap.add_argument("--no-pause", action="store_true", help="ランチャーを一時停止しない")
     a = ap.parse_args()
+    if a.check_font:
+        ok = True
+        for bold in (False, True):
+            font, path = find_font(14, bold)
+            print(("太字" if bold else "通常"), "→", path or "見つかりません")
+            ok = ok and path is not None
+        raise SystemExit(0 if ok else 1)
     cfg = json.load(open(a.keys)) if a.keys else None
 
     fb = FrameBuffer()
