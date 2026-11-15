@@ -43,6 +43,8 @@ def main(argv):
         print(__doc__.strip())
         return
     cmd, args = argv[0], argv[1:]
+    if cmd in ("get", "rm", "top") and (not args or not args[0].isdigit()):
+        sys.exit(f"czclip: {cmd} には ID が必要です (例: czclip {cmd} 12 / IDは czclip list で確認)")
 
     if cmd == "paste":
         n = int(args[0]) if args else 1

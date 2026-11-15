@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v0.5)
+"""HEXA CLIP — CardputerZero 用アプリ (v0.6.2)
 
 4つのモードを上のタブで切り替える:
   1 クリップ : カメラで文字を読み取り → 修正 → HEXA CLIPへ送る
@@ -37,7 +37,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -46,6 +46,7 @@ LORES_W, LORES_H = 640, 480          # プレビュー用(同じ画角)
 ZOOMS = [0.6, 0.3, 0.2]              # プレビューに映す横幅(全画角に対する割合) x1 / x2 / x3
 STILL_CFG = None                     # 全画素撮影の設定(open_cameraで作る)
 BOX = (24, 60, 296, 114)             # 読み取り枠(LCD座標)
+MAX_OCR_W = 3000                     # OCRに渡す最大幅(全画素の枠はこれ未満なので縮小されない)
 
 HOME = os.path.expanduser("~" + os.environ.get("SUDO_USER", ""))
 CLIP_URL = os.environ.get("HEXACLIP_URL", "http://127.0.0.1:8080")
@@ -205,8 +206,9 @@ class Keys:
             if code in ACTIONS:
                 events.append(("ACT", ACTIONS[code]))
                 continue
-            shift = (K_LSHIFT in self.held or K_RSHIFT in self.held
-                     or self.shift_once) != self.caps
+            shift = K_LSHIFT in self.held or K_RSHIFT in self.held or self.shift_once
+            if self.caps and CHARS[code][0].isalpha():
+                shift = not shift                # CapsLock は英字だけに効かせる (1 → ! にしない)
             events.append(("CHAR", CHARS[code][1 if shift else 0]))
             self.shift_once = False
         return events
@@ -368,13 +370,15 @@ def box_frac(cw):
 
 
 def prepare(img):
-    """OCR向けの前処理: 白地に黒へそろえる / 小さい切り出しは拡大 / 大きすぎれば縮小"""
+    """OCR向けの前処理: 白地に黒へそろえる / 小さい切り出しは拡大 / 極端に大きければ縮小
+
+    全画素撮影の枠(x1で約1670px)は縮小しない。以前は1400pxへ縮めて解像度を捨てていた。"""
     if np.asarray(img).mean() < 110:            # 暗い背景(ダークモードの画面など)は反転
         img = ImageOps.invert(img)
     if img.width < 900:                         # 小さい文字: 2倍に拡大
         img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
-    elif img.width > 1400:
-        img = img.resize((1400, int(img.height * 1400 / img.width)), Image.LANCZOS)
+    elif img.width > MAX_OCR_W:
+        img = img.resize((MAX_OCR_W, int(img.height * MAX_OCR_W / img.width)), Image.LANCZOS)
     return ImageOps.autocontrast(img, cutoff=1)
 
 
@@ -479,7 +483,21 @@ def send_clip(text, source="ocr"):
 
 
 # ---------------------------------------------------------------- editor
+_LAYOUT_CACHE = {}
+
+
 def layout(text, font, width):
+    """折り返し(同じ入力なら前回の結果を使う。大きいクリップで毎フレーム計算して重くなるのを防ぐ)"""
+    key = (id(font), width, text)
+    r = _LAYOUT_CACHE.get(key)
+    if r is None:
+        if len(_LAYOUT_CACHE) > 8:
+            _LAYOUT_CACHE.clear()
+        r = _LAYOUT_CACHE[key] = _layout(text, font, width)
+    return r
+
+
+def _layout(text, font, width):
     """折り返し。[(start, end), ...] 各行のtext上の範囲(改行文字は含まない)"""
     lines, start, cur_w = [], 0, 0.0
     i = 0
@@ -702,8 +720,16 @@ class App:
     def do_ocr(self):
         self.message("クリップ", "読み取り中...")
         t0 = time.time()
-        text = run_ocr(capture_crop(self.cam, self.pv.cw, self.st["hires"]),
-                       self.st["lang"], self.args.psm)
+        try:
+            text = run_ocr(capture_crop(self.cam, self.pv.cw, self.st["hires"]),
+                           self.st["lang"], self.args.psm)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.recover_camera()
+            self.say(f"読み取り失敗: {type(e).__name__}", 4)
+            self.keys.flush(0.2)
+            return
         dt = time.time() - t0
         print(f"----- OCR ({dt:.1f}s)\n{text}\n-----", flush=True)
         out = self.run_editor(text, dt)
@@ -714,6 +740,19 @@ class App:
                 self.last_id = max(self.last_id, it[0]["id"])
         else:
             self.say("破棄しました")
+
+    def recover_camera(self):
+        """撮影の失敗後、プレビューを動く状態に戻す"""
+        try:
+            self.cam.stop()
+        except Exception:
+            pass
+        try:
+            self.cam.start()
+            time.sleep(0.4)
+            self.cam_on = True
+        except Exception as e:
+            print("camera restart failed:", e, flush=True)
 
     def run_editor(self, text, elapsed=0.0):
         """編集画面(モーダル)。送る→文字列 / 破棄→None"""
@@ -773,11 +812,8 @@ class App:
                        font=self.font_s)
                 if i == 0:                      # fn+V で貼り付けられる項目
                     d.text((LCD_W - 40, y + 3), "fn+V", fill=ACC, font=self.font_s)
-                line = " ".join(it["text"].split())
                 lim = LCD_W - (84 if i == 0 else 44)
-                while line and self.font_s.getlength(line) > lim:
-                    line = line[:-2] + "…" if not line.endswith("…") else line[:-2] + "…"
-                d.text((34, y + 3), line, fill=FG, font=self.font_s)
+                d.text((34, y + 3), self.ellipsize(it["text"], lim), fill=FG, font=self.font_s)
             if len(self.items) > self.ROWS:
                 h = self.ROWS * self.ROW_H
                 bh = max(8, h * self.ROWS // len(self.items))
@@ -785,6 +821,20 @@ class App:
                 d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
         n = len(self.items) if self.items else 0
         return self.chrome(img, f"{A['u']}{A['d']}:選ぶ ENTER:開く V:貼付用にする  {n}件")
+
+    def ellipsize(self, text, lim):
+        """1行に収まるように省略。先頭だけ見て二分探索 (長いクリップで固まらない)"""
+        line = " ".join(text[:400].split())
+        if self.font_s.getlength(line) <= lim:
+            return line
+        lo, hi = 0, len(line)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.font_s.getlength(line[:mid] + "…") <= lim:
+                lo = mid
+            else:
+                hi = mid - 1
+        return line[:lo] + "…"
 
     def run_detail(self, item):
         """全文表示(モーダル)"""

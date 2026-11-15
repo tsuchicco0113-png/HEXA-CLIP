@@ -2,9 +2,14 @@
 # HEXA CLIP OCR launcher (ランチャー/コマンド共通の入口)
 #   video,input グループに入っていれば sudo なしで起動、
 #   入っていなければ sudo -n (パスワード不要設定がある場合) で起動する
+#
+# アプリは起動中ランチャー(APPLaunch)を SIGSTOP で止める。
+# アプリが異常終了 (libcamera のクラッシュ / SIGKILL など) しても本体が固まらないよう、
+# 終わったら必ずここでランチャーを再開する。
 DIR=$(dirname "$(readlink -f "$0")")
 APP="$DIR/ocr_cam.py"
 LOG="$HOME/.local/share/hexaclip/ocr.log"
+LAUNCHER=M5CardputerZero-APPLaunch
 mkdir -p "$(dirname "$LOG")"
 
 if [ -t 1 ]; then
@@ -13,7 +18,18 @@ else
   OUT="$LOG"               # ランチャーから起動 → ログへ
 fi
 
+resume_launcher() {
+  pkill -CONT -f "$LAUNCHER" 2>/dev/null || sudo -n pkill -CONT -f "$LAUNCHER" 2>/dev/null
+  return 0
+}
+trap 'resume_launcher; exit 130' INT TERM HUP
+
 if id -nG | tr ' ' '\n' | grep -qx video && id -nG | tr ' ' '\n' | grep -qx input; then
-  exec /usr/bin/python3 "$APP" "$@" >>"$OUT" 2>&1
+  /usr/bin/python3 "$APP" "$@" >>"$OUT" 2>&1
+else
+  sudo -n /usr/bin/python3 "$APP" "$@" >>"$OUT" 2>&1
 fi
-exec sudo -n /usr/bin/python3 "$APP" "$@" >>"$OUT" 2>&1
+RC=$?
+resume_launcher
+[ "$RC" -ne 0 ] && echo "$(date '+%F %T') ocr_cam exited with $RC (launcher resumed)" >>"$LOG"
+exit "$RC"

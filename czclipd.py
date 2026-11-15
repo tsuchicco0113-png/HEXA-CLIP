@@ -20,7 +20,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.2"
+VERSION = "0.3"
 DATA_DIR = os.path.expanduser(os.environ.get("HEXACLIP_DIR", "~/.local/share/hexaclip"))
 DB_PATH = os.path.join(DATA_DIR, "clip.db")
 PIN_PATH = os.path.join(DATA_DIR, "pin")
@@ -48,6 +48,11 @@ class Store:
                 expires REAL NOT NULL);
         """)
         self.db.commit()
+        # 追加/削除/並び替えのたびに増える番号。Web画面はこれが変わったら一覧を取り直す
+        self.rev = int(time.time() * 1000)
+
+    def _bump(self):
+        self.rev += 1
 
     def add(self, text, source):
         text = normalize(text)
@@ -59,6 +64,7 @@ class Store:
                 "DELETE FROM items WHERE id NOT IN "
                 "(SELECT id FROM items ORDER BY id DESC LIMIT ?)", (MAX_ITEMS,))
             self.db.commit()
+            self._bump()
             return cur.lastrowid
 
     def list(self, limit=50, after=0):
@@ -84,12 +90,15 @@ class Store:
             cur = self.db.execute("INSERT INTO items(text, source, created) VALUES(?,?,?)",
                                   (r[0], r[1], time.time()))
             self.db.commit()
+            self._bump()
             return cur.lastrowid
 
     def delete(self, item_id):
         with self.lock:
             n = self.db.execute("DELETE FROM items WHERE id=?", (item_id,)).rowcount
             self.db.commit()
+            if n:
+                self._bump()
         return n > 0
 
     def new_session(self):
@@ -191,14 +200,14 @@ padding:8px 16px;border-radius:20px;font-weight:600;opacity:0;transition:.2s;poi
 </main></div>
 <div id="toast"></div>
 <script>
-const $=id=>document.getElementById(id);let last=0,items=[];
+const $=id=>document.getElementById(id);let rev=null,items=[];
 function toast(m){const t=$('toast');t.textContent=m;t.classList.add('on');setTimeout(()=>t.classList.remove('on'),1400)}
 async function api(p,o={}){const r=await fetch(p,Object.assign({credentials:'same-origin',
  headers:{'Content-Type':'application/json'}},o));if(r.status==401){show(false);throw 401}
  if(!r.ok)throw await r.text();return r.json()}
 function show(ok){$('login').hidden=ok;$('app').hidden=!ok;if(!ok)$('pin').focus()}
 async function login(){try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
- body:JSON.stringify({pin:$('pin').value.trim()})});if(r.ok){show(true);load(true)}else{$('lerr').textContent=
+ body:JSON.stringify({pin:$('pin').value.trim()})});if(r.ok){show(true);load()}else{$('lerr').textContent=
  r.status==429?'ロック中 しばらく待ってください':'PINが違います'}}catch(e){$('lerr').textContent='接続エラー'}}
 $('pin').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
 function fmt(t){const d=new Date(t*1000);return d.toLocaleString('ja-JP',{month:'numeric',day:'numeric',
@@ -208,13 +217,14 @@ function render(){$('list').innerHTML=items.length?items.map(i=>`<div class="ite
  <div class="meta"><span class="src">${esc(i.source)}</span><span>${fmt(i.created)}</span><span class="sp"></span>
  <button onclick="del(${i.id})">削除</button><button class="pri" onclick="cp(${i.id})">コピー</button></div></div>`).join('')
  :'<div class="empty">まだ何もありません</div>'}
-async function load(full){try{const r=await api('/api/items?limit=50'+(full?'':'&after='+last));
- if(full)items=r.items;else items=r.items.concat(items);if(items.length)last=Math.max(...items.map(i=>i.id));
- if(full||r.items.length)render();$('st').textContent='● 接続中';$('st').style.color='var(--acc)'}
- catch(e){if(e!==401){$('st').textContent='● 切断';$('st').style.color='#ff6b6b'}}}
+function online(ok){$('st').textContent=ok?'● 接続中':'● 切断';$('st').style.color=ok?'var(--acc)':'#ff6b6b'}
+async function load(){try{const r=await api('/api/items?limit=50');items=r.items;rev=r.rev;render();online(true)}
+ catch(e){if(e!==401)online(false)}}
+async function poll(){try{const r=await api('/api/ping');online(true);if(r.rev!==rev)await load()}
+ catch(e){if(e!==401)online(false)}}
 async function send(){const v=$('t').value;if(!v.trim())return;try{await api('/api/items',{method:'POST',
- body:JSON.stringify({text:v,source:'web'})});$('t').value='';toast('送りました');load(false)}catch(e){toast('失敗')}}
-async function del(id){await api('/api/items/'+id,{method:'DELETE'});items=items.filter(i=>i.id!==id);render()}
+ body:JSON.stringify({text:v,source:'web'})});$('t').value='';toast('送りました');load()}catch(e){toast('失敗')}}
+async function del(id){try{await api('/api/items/'+id,{method:'DELETE'})}catch(e){}load()}
 function cp(id){const s=items.find(i=>i.id===id).text;
  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(s).then(()=>toast('コピーしました'))}
  else{const ta=document.createElement('textarea');ta.value=s;ta.style.position='fixed';ta.style.opacity='0';
@@ -222,8 +232,9 @@ function cp(id){const s=items.find(i=>i.id===id).text;
  try{document.execCommand('copy');toast('コピーしました')}catch(e){toast('コピー失敗')}ta.remove()}}
 (async()=>{const m=location.hash.match(/pin=(\d{6})/);
  if(m){history.replaceState(null,'',location.pathname);$('pin').value=m[1];await login();if($('app').hidden)show(false);return}
- try{await api('/api/ping');show(true);load(true)}catch(e){}})();
-setInterval(()=>{if(!$('app').hidden)load(false)},3000);
+ try{await api('/api/ping');show(true);load()}catch(e){}})();
+setInterval(()=>{if(!$('app').hidden&&!document.hidden)poll()},2000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!$('app').hidden)poll()});
 </script></body></html>
 """
 
@@ -286,10 +297,13 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         if n > MAX_TEXT + 1024:
             raise ValueError("too large")
-        return json.loads(self.rfile.read(n) or b"{}")
+        data = json.loads(self.rfile.read(n) or b"{}")
+        if not isinstance(data, dict):
+            raise ValueError("json must be an object")
+        return data
 
     # routes
-    def do_GET(self):
+    def _do_GET(self):
         u = urlparse(self.path)
         if u.path == "/":
             body = PAGE.encode()
@@ -303,12 +317,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authed():
             return self.send_json({"error": "auth"}, 401)
         if u.path == "/api/ping":
-            return self.send_json({"ok": True, "version": VERSION})
+            return self.send_json({"ok": True, "version": VERSION, "rev": self.app.store.rev})
         if u.path == "/api/items":
             q = parse_qs(u.query)
-            limit = min(int(q.get("limit", ["50"])[0]), MAX_ITEMS)
-            after = int(q.get("after", ["0"])[0])
-            return self.send_json({"items": self.app.store.list(limit, after)})
+            limit = max(1, min(int(q.get("limit", ["50"])[0]), MAX_ITEMS))
+            after = max(0, int(q.get("after", ["0"])[0]))
+            return self.send_json({"items": self.app.store.list(limit, after),
+                                   "rev": self.app.store.rev})
         if u.path.startswith("/api/items/"):
             it = self.app.store.get(int(u.path.rsplit("/", 1)[1]))
             return self.send_json(it) if it else self.send_json({"error": "not found"}, 404)
@@ -316,7 +331,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"pin": self.app.pin, "url": f"http://{lan_ip()}:{self.server.server_port}/"})
         self.send_json({"error": "not found"}, 404)
 
-    def do_POST(self):
+    def _do_POST(self):
         u = urlparse(self.path)
         try:
             data = self.read_json()
@@ -347,7 +362,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True})
         self.send_json({"error": "not found"}, 404)
 
-    def do_DELETE(self):
+    def _do_DELETE(self):
         if not self.authed():
             return self.send_json({"error": "auth"}, 401)
         u = urlparse(self.path)
@@ -355,6 +370,23 @@ class Handler(BaseHTTPRequestHandler):
             ok = self.app.store.delete(int(u.path.rsplit("/", 1)[1]))
             return self.send_json({"ok": ok}, 200 if ok else 404)
         self.send_json({"error": "not found"}, 404)
+
+
+    def _safe(self, fn):
+        """不正なID・数値などは 400 を返す (以前は例外で接続が切れていた)"""
+        try:
+            fn()
+        except (ValueError, TypeError, KeyError, IndexError):
+            self.send_json({"error": "bad request"}, 400)
+
+    def do_GET(self):
+        self._safe(self._do_GET)
+
+    def do_POST(self):
+        self._safe(self._do_POST)
+
+    def do_DELETE(self):
+        self._safe(self._do_DELETE)
 
 
 class DualStackServer(ThreadingHTTPServer):
