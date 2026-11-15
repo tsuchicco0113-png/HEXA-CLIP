@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v1.2)
+"""HEXA CLIP — CardputerZero 用アプリ (v1.3)
 
 スマホやPCから送ったコード・資料を受け取って、本体で使う (fn+V で打ち込む / ~/clip/ に置く)。
 
@@ -42,7 +42,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-VERSION = "1.2"
+VERSION = "1.3"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -78,6 +78,7 @@ def chown_user(*paths):
 SETTING_DEFS = [
     ("auto_show", "受信したら", [False, True], ["通知だけ", "本文を開く"]),
     ("paste_newline", "fn+V の改行", ["enter", "none"], ["ENTERで打つ", "打たない (1行に)"]),
+    ("notify_banner", "ほかのアプリ中に受信", [True, False], ["上に帯を出す", "出さない"]),
     ("lang", "カメラ: 言語", ["jpn", "jpn+eng", "eng", "code"],
      ["日本語", "日本語+英語", "英語", "コード"]),
     ("hires", "カメラ: 高精細", [True, False], ["ON (小さい文字)", "OFF (速い)"]),

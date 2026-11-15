@@ -10,7 +10,7 @@ fi
 APPL=/usr/share/APPLaunch
 
 echo "== packages"
-sudo apt-get install -y python3-pil python3-qrcode tesseract-ocr tesseract-ocr-jpn tesseract-ocr-eng zbar-tools >/dev/null
+sudo apt-get install -y python3-pil python3-numpy python3-qrcode tesseract-ocr tesseract-ocr-jpn tesseract-ocr-eng zbar-tools >/dev/null
 
 echo "== files"
 chmod +x "$DIR/czclip" "$DIR/czclipd.py" "$DIR/czpasted.py" "$DIR/ocr_cam.py" "$DIR/hexaclip-ocr" "$DIR/pc/hexaclip.py"
@@ -52,7 +52,7 @@ echo "== paste service (fn+V で貼り付け)"
 write_paste_unit() {   # $1 = "user" または "root"
   if [ "$1" = "user" ]; then
     RUNAS="User=$U
-SupplementaryGroups=input"
+SupplementaryGroups=input video"
   else
     RUNAS=""
   fi
