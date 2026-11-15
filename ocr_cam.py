@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v0.7.1)
+"""HEXA CLIP — CardputerZero 用アプリ (v0.7.2)
 
 4つのモードを上のタブで切り替える:
   1 クリップ : カメラで文字を読み取り → 修正 → HEXA CLIPへ送る
@@ -8,7 +8,7 @@
   4 設定     : OCR言語 / 全画素撮影 / ズーム / 受信時の自動表示
 
 共通の操作:
-  TAB = 次のモード   1〜4 = モードを直接選択   ESC = 戻る (一番上の画面では終了)
+  TAB = 次のモード   1〜4 = モードを直接選択   ESC = 戻る (一番上の画面では確認のうえ終了)
   方向キー = F(↑) X(↓) Z(←) C(→)   ※本体の流儀と同じ。文字入力画面では fn を押しながら
   画面下に、その画面で使えるキーを常に表示
 
@@ -37,7 +37,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -863,6 +863,24 @@ class App:
         ImageDraw.Draw(img).text((8, 60), body, fill=FG, font=self.font)
         self.fb.show(self.chrome(img, "", tabs=False, title=title))
 
+    def confirm_quit(self, base):
+        """終了の確認ウィンドウ。ENTER で True、それ以外のキーで False (戻る)"""
+        img = Image.blend(base, Image.new("RGB", base.size), 0.65)
+        d = ImageDraw.Draw(img)
+        x0, y0, x1, y1 = 40, 42, LCD_W - 40, LCD_H - 38
+        d.rounded_rectangle((x0, y0, x1, y1), 8, fill=(26, 30, 38), outline=ACC, width=2)
+        for i, (txt, font, col) in enumerate([
+                ("HEXA CLIP を終了しますか?", self.font, FG),
+                ("ENTER: 終了    ESC: 戻る", self.font_s, ACC)]):
+            w = font.getlength(txt)
+            d.text(((LCD_W - w) / 2, y0 + 16 + i * 32), txt, fill=col, font=font)
+        self.fb.show(img)
+        self.keys.flush(0.2)
+        while True:
+            for kind, val in self.keys.poll(0.5):
+                self.keys.flush(0.1)
+                return kind == "ACT" and val == "ENTER"
+
     # ---- camera on/off (クリップ以外では止めて電池を節約)
     def set_cam(self, on):
         if on == self.cam_on:
@@ -1236,7 +1254,9 @@ class App:
 
             for kind, val in nav(self.keys.poll(0.0 if self.mode == M_CLIP else 0.25)):
                 if kind == "ACT" and val == "ESC":
-                    return f"ESC / frames={frames}"
+                    if self.confirm_quit(img):
+                        return f"ESC / frames={frames}"
+                    break
                 if kind == "ACT" and val == "TAB":
                     self.set_mode(self.mode + 1)
                     break
