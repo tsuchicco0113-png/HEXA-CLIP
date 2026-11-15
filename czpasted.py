@@ -163,9 +163,9 @@ def main():
 
     def erase():
         try:
-            return bool(json.load(open(a.settings)).get("paste_erase"))
+            return bool(json.load(open(a.settings)).get("paste_erase", True))
         except Exception:
-            return False
+            return True                 # 本体は fn+V で V が入力されるため、既定で消す
 
     dev = find_keyboard()
     fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)

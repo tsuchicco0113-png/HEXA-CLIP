@@ -74,7 +74,7 @@ SETTING_DEFS = [
     ("hires", "高精細撮影", [True, False], ["ON (小さい文字向き)", "OFF (速い)"]),
     ("zoom", "起動時のズーム", [0, 1, 2], ["x1", "x2", "x3"]),
     ("auto_show", "受信したら表示", [False, True], ["OFF (通知のみ)", "ON (本文を開く)"]),
-    ("paste_erase", "fn+V貼付で1文字消す", [False, True], ["OFF", "ON (vが入る時)"]),
+    ("paste_erase", "fn+Vで入るVを消す", [True, False], ["ON", "OFF"]),
 ]
 
 
