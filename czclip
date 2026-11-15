@@ -9,6 +9,7 @@
   czclip top ID           最新に移す (本体の fn+V で貼り付ける対象になる)
   czclip pin              スマホ接続用のURLとPINを表示
   czclip qr               スマホ接続用のQRコードを端末に表示 (読むだけでログイン)
+  czclip token [reset]    共有シート/ショートカット用のトークンと送り方を表示 (reset で作り直し)
   czclip logout-all       全端末をログアウト(PINは czclipd --reset-pin で変更)
 """
 import json
@@ -73,6 +74,24 @@ def main(argv):
     elif cmd == "pin":
         r = call("GET", "/api/pin")
         print(f"URL: {r['url']}\nPIN: {r['pin']}")
+        if r.get("mdns"):
+            print(f"名前: {r['mdns']}  (IPが変わっても同じ。対応していない端末もあります)")
+        if r.get("online") is False:
+            print("※ Wi-Fi に接続されていません")
+    elif cmd == "token":
+        r = call("POST", "/api/token/reset", {}) if args[:1] == ["reset"] else call("GET", "/api/token")
+        p = call("GET", "/api/pin")
+        base = (p.get("mdns") or p["url"]).rstrip("/")
+        print(f"TOKEN: {r['token']}\n")
+        print("送る (スマホ→CPZ):")
+        print(f"  POST {base}/api/items")
+        print(f"  ヘッダ  Authorization: Bearer {r['token']}")
+        print("          Content-Type: text/plain")
+        print("  本文    送りたい文字\n")
+        print("受け取る (CPZ→スマホ):")
+        print(f"  GET  {base}/api/latest   (同じ Authorization ヘッダ)\n")
+        print(f"例: curl -H 'Authorization: Bearer {r['token']}' -H 'Content-Type: text/plain' \\")
+        print(f"      --data-binary @memo.txt {base}/api/items")
     elif cmd == "qr":
         r = call("GET", "/api/pin")
         try:

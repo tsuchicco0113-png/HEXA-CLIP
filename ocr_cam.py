@@ -518,14 +518,34 @@ def clean(text):
     return text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
 
 
-def clip_items(limit=50):
+def clip_items(limit=50, preview=200):
+    """一覧 (本文は先頭 preview 文字だけ。全文は clip_get で)"""
     try:
-        items = clip_call("GET", f"/api/items?limit={limit}", timeout=1.0)["items"]
+        items = clip_call("GET", f"/api/items?limit={limit}&preview={preview}", timeout=1.0)["items"]
         for it in items:
             it["text"] = clean(it["text"])
         return items
     except Exception:
         return None                      # None = サーバー停止中
+
+
+def clip_get(item):
+    """全文が必要なとき (一覧はプレビューなので)"""
+    if not item.get("truncated"):
+        return item
+    try:
+        full = clip_call("GET", f"/api/items/{item['id']}", timeout=2.0)
+        full["text"] = clean(full["text"])
+        return full
+    except Exception:
+        return item
+
+
+def clip_rev():
+    try:
+        return clip_call("GET", "/api/ping", timeout=1.0).get("rev")
+    except Exception:
+        return None
 
 
 def to_top(item_id):
@@ -782,10 +802,11 @@ class App:
         self.items, self.sel, self.top = [], 0, 0
         self.set_sel = 0
         self.qr_img = None
-        it = clip_items(1)
+        it = clip_items(1, 80)
         self.last_id = it[0]["id"] if it else 0
-        self.next_check = time.time() + 2
-        self.next_list = 0.0
+        self.rev = clip_rev()
+        self.next_check = time.time() + 1
+        self.next_list = 0.0                # 0 = 一覧を取り直す
 
     # ---- drawing
     def canvas(self):
@@ -980,6 +1001,7 @@ class App:
 
     def run_detail(self, item):
         """全文表示(モーダル)"""
+        item = clip_get(item)
         A = self.AR
         text, scroll, armed, note = item["text"], 0, False, ""
         rows = (LCD_H - TOP_H - BOT_H - 2) // 20
@@ -1069,6 +1091,12 @@ class App:
             d.text((8, 78), "sudo systemctl start hexaclip", fill=SUB, font=self.font_s)
             return img
         url, pin = info["url"], info["pin"]
+        if info.get("online") is False:
+            d.text((8, 40), "Wi-Fi に接続されていません", fill=(255, 200, 0), font=self.font)
+            d.text((8, 68), "本体の設定で Wi-Fi につなぐか、", fill=SUB, font=self.font_s)
+            d.text((8, 86), "スマホのテザリングに接続してください", fill=SUB, font=self.font_s)
+            d.text((8, 112), f"PIN {pin}", fill=ACC, font=self.font)
+            return img
         x = 8
         side = LCD_H - TOP_H - BOT_H - 4
         try:
@@ -1084,15 +1112,18 @@ class App:
             img.paste(q, (4, TOP_H + 2 + (side - q.height) // 2))
             x = 4 + q.width + 10
         except ImportError:
-            d.text((8, 118), "QR: sudo apt install python3-qrcode", fill=(255, 200, 0),
+            d.text((8, LCD_H - BOT_H - 16), "QR: sudo apt install python3-qrcode", fill=(255, 200, 0),
                    font=self.font_s)
         host = url.replace("http://", "").rstrip("/")
         d.text((x, TOP_H + 6), "または URL", fill=SUB, font=self.font_s)
         for i, part in enumerate(host.split(":")):
             d.text((x, TOP_H + 24 + i * 17), part if i == 0 else ":" + part, fill=FG,
                    font=self.font_s)
-        d.text((x, TOP_H + 66), "PIN", fill=SUB, font=self.font_s)
-        d.text((x, TOP_H + 82), pin, fill=ACC, font=self.font)
+        d.text((x, TOP_H + 62), "PIN", fill=SUB, font=self.font_s)
+        d.text((x, TOP_H + 76), pin, fill=ACC, font=self.font)
+        if info.get("mdns"):                # IPが変わっても使える名前
+            name = info["mdns"].replace("http://", "").rstrip("/")
+            d.text((x, TOP_H + 102), name, fill=SUB, font=self.font_s)
         return img
 
     # ---- 4 設定
@@ -1144,12 +1175,17 @@ class App:
     def check_incoming(self):
         if time.time() < self.next_check:
             return
-        self.next_check = time.time() + 2
-        it = clip_items(1)
+        self.next_check = time.time() + 1
+        rev = clip_rev()
+        if rev is None or rev == self.rev:
+            return
+        self.rev = rev
+        self.next_list = 0.0                # 何か変わった → 履歴を取り直す
+        it = clip_items(1, 80)
         if not it or it[0]["id"] <= self.last_id:
             return
         self.last_id = it[0]["id"]
-        if it[0]["source"] in ("ocr", "edit"):
+        if it[0]["source"] in ("ocr", "edit") or it[0].get("moved"):
             return
         self.say(f"受信 #{it[0]['id']} ({it[0]['source']})", 3)
         self.next_list = 0.0
@@ -1169,9 +1205,9 @@ class App:
             if self.mode == M_CLIP:
                 img = self.draw_clip()
             elif self.mode == M_HIST:
-                if time.time() > self.next_list:
+                if time.time() > self.next_list:   # 変更通知が来た時 (+念のため30秒ごと)
                     self.refresh_items()
-                    self.next_list = time.time() + 2
+                    self.next_list = time.time() + 30
                 img = self.draw_hist()
             elif self.mode == M_QR:
                 img = self.draw_qr()

@@ -25,10 +25,12 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4"
+VERSION = "0.5"
 DATA_DIR = os.path.expanduser(os.environ.get("HEXACLIP_DIR", "~/.local/share/hexaclip"))
 DB_PATH = os.path.join(DATA_DIR, "clip.db")
 PIN_PATH = os.path.join(DATA_DIR, "pin")
+TOKEN_PATH = os.path.join(DATA_DIR, "api_token")
+MAX_SSE = 8                    # 同時にリアルタイム接続できる数
 MAX_TEXT = 256 * 1024          # 1件の上限 256KB
 MAX_ITEMS = 500                # 履歴の上限
 MAX_IMAGE = 12 * 1024 * 1024   # スマホ撮影の画像 12MB
@@ -55,12 +57,24 @@ class Store:
                 token TEXT PRIMARY KEY,
                 expires REAL NOT NULL);
         """)
+        cols = [r[1] for r in self.db.execute("PRAGMA table_info(items)")]
+        if "moved" not in cols:          # 0.5で追加: 「貼付用」で移しただけの項目 (受信通知しない)
+            self.db.execute("ALTER TABLE items ADD COLUMN moved INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
-        # 追加/削除/並び替えのたびに増える番号。Web画面はこれが変わったら一覧を取り直す
+        # 追加/削除/並び替え/編集のたびに増える番号。画面はこれが変わったら一覧を取り直す
         self.rev = int(time.time() * 1000)
+        self.changed = threading.Condition()
 
     def _bump(self):
-        self.rev += 1
+        with self.changed:
+            self.rev += 1
+            self.changed.notify_all()
+
+    def wait_change(self, rev, timeout):
+        """rev から変わるまで待つ (リアルタイム通知用)。変わった後の rev を返す"""
+        with self.changed:
+            self.changed.wait_for(lambda: self.rev != rev, timeout)
+            return self.rev
 
     def add(self, text, source):
         text = normalize(text)
@@ -75,18 +89,26 @@ class Store:
             self._bump()
             return cur.lastrowid
 
-    def list(self, limit=50, after=0):
+    COLS = "id, text, source, created, moved"
+
+    @staticmethod
+    def _row(r, preview=0):
+        d = dict(id=r[0], text=r[1], source=r[2], created=r[3], moved=bool(r[4]), length=len(r[1]))
+        if preview and len(r[1]) > preview:  # 一覧用: 先頭だけ送る (本体の2秒ごとの取得を軽く)
+            d["text"], d["truncated"] = r[1][:preview], True
+        return d
+
+    def list(self, limit=50, after=0, preview=0):
         with self.lock:
             rows = self.db.execute(
-                "SELECT id, text, source, created FROM items WHERE id > ? "
+                f"SELECT {self.COLS} FROM items WHERE id > ? "
                 "ORDER BY id DESC LIMIT ?", (after, limit)).fetchall()
-        return [dict(id=r[0], text=r[1], source=r[2], created=r[3]) for r in rows]
+        return [self._row(r, preview) for r in rows]
 
     def get(self, item_id):
         with self.lock:
-            r = self.db.execute(
-                "SELECT id, text, source, created FROM items WHERE id=?", (item_id,)).fetchone()
-        return dict(id=r[0], text=r[1], source=r[2], created=r[3]) if r else None
+            r = self.db.execute(f"SELECT {self.COLS} FROM items WHERE id=?", (item_id,)).fetchone()
+        return self._row(r) if r else None
 
     def to_top(self, item_id):
         """指定の項目を最新(一番上)に移す。新しいIDを返す"""
@@ -95,7 +117,7 @@ class Store:
             if not r:
                 return None
             self.db.execute("DELETE FROM items WHERE id=?", (item_id,))
-            cur = self.db.execute("INSERT INTO items(text, source, created) VALUES(?,?,?)",
+            cur = self.db.execute("INSERT INTO items(text, source, created, moved) VALUES(?,?,?,1)",
                                   (r[0], r[1], time.time()))
             self.db.commit()
             self._bump()
@@ -157,6 +179,25 @@ def load_pin(reset=False):
             f.write(pin)
         return pin
     return open(PIN_PATH).read().strip()
+
+
+def load_token(reset=False):
+    """共有シート/ショートカット用のAPIトークン (Authorization: Bearer ...)"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if reset or not os.path.exists(TOKEN_PATH):
+        tok = secrets.token_urlsafe(24)
+        fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(tok)
+        return tok
+    return open(TOKEN_PATH).read().strip()
+
+
+def mdns_name():
+    """avahi が動いていれば <hostname>.local で届く (IPが変わってもURLが同じ)"""
+    if os.path.exists("/run/avahi-daemon/pid") or os.path.exists("/var/run/avahi-daemon/pid"):
+        return socket.gethostname().split(".")[0] + ".local"
+    return None
 
 
 def lan_ip():
@@ -384,7 +425,13 @@ async function doOcr(){if(!src)return;const b=$('ocrBtn');b.disabled=true;b.text
 (async()=>{const m=location.hash.match(/pin=(\d{6})/);
  if(m){history.replaceState(null,'',location.pathname);$('pin').value=m[1];await login();if($('app').hidden)show(false);return}
  try{await api('/api/ping');show(true);load()}catch(e){}})();
-setInterval(()=>{if(!$('app').hidden&&!document.hidden)poll()},2000);
+// 変更は SSE で即時に受け取る。つながらない間だけ2秒ごとの確認に戻す
+let es=null,sseOk=false;
+function startSSE(){if(es||!window.EventSource||$('app').hidden)return;es=new EventSource('/api/events');
+ es.onopen=()=>{sseOk=true;online(true)};
+ es.onmessage=e=>{sseOk=true;online(true);if(+e.data!==rev)load()};
+ es.onerror=()=>{sseOk=false;es.close();es=null;setTimeout(startSSE,5000)}}
+setInterval(()=>{if($('app').hidden||document.hidden)return;if(!es)startSSE();if(!sseOk)poll()},2000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!$('app').hidden)poll()});
 </script></body></html>
 """
@@ -392,9 +439,12 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!$('app')
 
 # ------------------------------------------------------------------ server
 class App:
-    def __init__(self, store, pin):
+    def __init__(self, store, pin, token):
         self.store = store
         self.pin = pin
+        self.token = token
+        self.sse = 0
+        self.sse_lock = threading.Lock()
         self.fail = {}          # ip -> (count, locked_until)
         self.flock = threading.Lock()
 
@@ -430,8 +480,49 @@ class Handler(BaseHTTPRequestHandler):
         c = SimpleCookie(self.headers.get("Cookie", ""))
         return c["hc"].value if "hc" in c else None
 
+    def bearer(self):
+        h = self.headers.get("Authorization", "")
+        tok = h[7:].strip() if h.lower().startswith("bearer ") else ""
+        return bool(tok) and hmac.compare_digest(tok, self.app.token)
+
     def authed(self):
-        return self.is_local() or self.app.store.valid_session(self.token())
+        return (self.is_local() or self.bearer()
+                or self.app.store.valid_session(self.token()))
+
+    def send_text(self, text, code=200):
+        body = text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def events(self):
+        """Server-Sent Events: 変更があった瞬間に rev を送る (Web画面の即時反映)"""
+        with self.app.sse_lock:
+            if self.app.sse >= MAX_SSE:
+                return self.send_json({"error": "busy"}, 503)
+            self.app.sse += 1
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            rev = self.app.store.rev
+            self.wfile.write(f"data: {rev}\n\n".encode())
+            self.wfile.flush()
+            while True:
+                new = self.app.store.wait_change(rev, 25)
+                msg = f"data: {new}\n\n" if new != rev else ": keepalive\n\n"
+                rev = new
+                self.wfile.write(msg.encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with self.app.sse_lock:
+                self.app.sse -= 1
 
     def send_json(self, obj, code=200, extra=None):
         body = json.dumps(obj, ensure_ascii=False).encode()
@@ -448,7 +539,12 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         if n > MAX_TEXT + 1024:
             raise ValueError("too large")
-        data = json.loads(self.rfile.read(n) or b"{}")
+        raw = self.rfile.read(n)
+        if self.headers.get("Content-Type", "").startswith("text/plain"):
+            # ショートカット等から本文をそのまま送る (source は ?source= で指定、既定 share)
+            src = parse_qs(urlparse(self.path).query).get("source", ["share"])[0]
+            return {"text": raw.decode("utf-8", "replace"), "source": src}
+        data = json.loads(raw or b"{}")
         if not isinstance(data, dict):
             raise ValueError("json must be an object")
         return data
@@ -469,17 +565,28 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "auth"}, 401)
         if u.path == "/api/ping":
             return self.send_json({"ok": True, "version": VERSION, "rev": self.app.store.rev})
+        if u.path == "/api/events":
+            return self.events()
         if u.path == "/api/items":
             q = parse_qs(u.query)
             limit = max(1, min(int(q.get("limit", ["50"])[0]), MAX_ITEMS))
             after = max(0, int(q.get("after", ["0"])[0]))
-            return self.send_json({"items": self.app.store.list(limit, after),
+            preview = max(0, int(q.get("preview", ["0"])[0]))
+            return self.send_json({"items": self.app.store.list(limit, after, preview),
                                    "rev": self.app.store.rev})
+        if u.path == "/api/latest":            # 最新の本文だけ (ショートカットで「CPZからコピー」)
+            items = self.app.store.list(1)
+            return self.send_text(items[0]["text"] if items else "")
         if u.path.startswith("/api/items/"):
             it = self.app.store.get(int(u.path.rsplit("/", 1)[1]))
             return self.send_json(it) if it else self.send_json({"error": "not found"}, 404)
         if u.path == "/api/pin" and self.is_local():
-            return self.send_json({"pin": self.app.pin, "url": f"http://{lan_ip()}:{self.server.server_port}/"})
+            ip, port, m = lan_ip(), self.server.server_port, mdns_name()
+            return self.send_json({"pin": self.app.pin, "url": f"http://{ip}:{port}/",
+                                   "online": ip != "127.0.0.1",
+                                   "mdns": f"http://{m}:{port}/" if m else None})
+        if u.path == "/api/token" and self.is_local():
+            return self.send_json({"token": self.app.token})
         self.send_json({"error": "not found"}, 404)
 
     def _do_POST(self):
@@ -510,6 +617,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path.startswith("/api/items/") and u.path.endswith("/top"):
             new = self.app.store.to_top(int(u.path.split("/")[3]))
             return self.send_json({"id": new}) if new else self.send_json({"error": "not found"}, 404)
+        if u.path == "/api/token/reset" and self.is_local():
+            self.app.token = load_token(True)
+            return self.send_json({"token": self.app.token})
         if u.path == "/api/logout_all" and self.is_local():
             self.app.store.clear_sessions()
             return self.send_json({"ok": True})
@@ -609,7 +719,7 @@ def main():
         print(f"new PIN: {pin}  (sudo systemctl restart hexaclip で反映)")
         return
     pin = load_pin()
-    Handler.app = App(store, pin)
+    Handler.app = App(store, pin, load_token())
     srv = DualStackServer((a.bind, a.port), Handler)
     print(f"HEXA CLIP {VERSION}  http://{lan_ip()}:{a.port}/  PIN={pin}", flush=True)
     try:
