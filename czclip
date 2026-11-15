@@ -6,6 +6,7 @@
   czclip list [N]         履歴一覧(既定10件)
   czclip get ID           ID指定で出力
   czclip rm ID            削除
+  czclip top ID           最新に移す (本体の fn+V で貼り付ける対象になる)
   czclip pin              スマホ接続用のURLとPINを表示
   czclip qr               スマホ接続用のQRコードを端末に表示 (読むだけでログイン)
   czclip logout-all       全端末をログアウト(PINは czclipd --reset-pin で変更)
@@ -61,6 +62,9 @@ def main(argv):
             print(f"#{it['id']:<5} [{it['source']:<4}] {one_line(it['text'])}")
     elif cmd == "get":
         sys.stdout.write(call("GET", f"/api/items/{int(args[0])}")["text"])
+    elif cmd == "top":
+        r = call("POST", f"/api/items/{int(args[0])}/top", {})
+        print(f"#{args[0]} -> #{r['id']} (最新)", file=sys.stderr)
     elif cmd == "rm":
         call("DELETE", f"/api/items/{int(args[0])}")
         print("deleted", file=sys.stderr)

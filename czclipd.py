@@ -74,6 +74,18 @@ class Store:
                 "SELECT id, text, source, created FROM items WHERE id=?", (item_id,)).fetchone()
         return dict(id=r[0], text=r[1], source=r[2], created=r[3]) if r else None
 
+    def to_top(self, item_id):
+        """指定の項目を最新(一番上)に移す。新しいIDを返す"""
+        with self.lock:
+            r = self.db.execute("SELECT text, source FROM items WHERE id=?", (item_id,)).fetchone()
+            if not r:
+                return None
+            self.db.execute("DELETE FROM items WHERE id=?", (item_id,))
+            cur = self.db.execute("INSERT INTO items(text, source, created) VALUES(?,?,?)",
+                                  (r[0], r[1], time.time()))
+            self.db.commit()
+            return cur.lastrowid
+
     def delete(self, item_id):
         with self.lock:
             n = self.db.execute("DELETE FROM items WHERE id=?", (item_id,)).rowcount
@@ -327,6 +339,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error": "too large"}, 413)
             src = str(data.get("source", "web"))[:16]
             return self.send_json({"id": self.app.store.add(text, src)})
+        if u.path.startswith("/api/items/") and u.path.endswith("/top"):
+            new = self.app.store.to_top(int(u.path.split("/")[3]))
+            return self.send_json({"id": new}) if new else self.send_json({"error": "not found"}, 404)
         if u.path == "/api/logout_all" and self.is_local():
             self.app.store.clear_sessions()
             return self.send_json({"ok": True})

@@ -37,7 +37,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.6"
+VERSION = "0.6.1"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -451,6 +451,14 @@ def clip_items(limit=50):
         return None                      # None = サーバー停止中
 
 
+def to_top(item_id):
+    """最新に移す → fn+V の貼り付け対象になる。新しいIDを返す"""
+    try:
+        return clip_call("POST", f"/api/items/{item_id}/top", {})["id"]
+    except Exception:
+        return None
+
+
 def save_file(text, name):
     os.makedirs(CLIP_DIR, exist_ok=True)
     p = os.path.join(CLIP_DIR, name)
@@ -763,8 +771,11 @@ class App:
                     d.rectangle((0, y, 2, y + self.ROW_H - 1), fill=ACC)
                 d.text((6, y + 3), it["source"][:3], fill=colors.get(it["source"], SUB),
                        font=self.font_s)
+                if i == 0:                      # fn+V で貼り付けられる項目
+                    d.text((LCD_W - 40, y + 3), "fn+V", fill=ACC, font=self.font_s)
                 line = " ".join(it["text"].split())
-                while line and self.font_s.getlength(line) > LCD_W - 44:
+                lim = LCD_W - (84 if i == 0 else 44)
+                while line and self.font_s.getlength(line) > lim:
                     line = line[:-2] + "…" if not line.endswith("…") else line[:-2] + "…"
                 d.text((34, y + 3), line, fill=FG, font=self.font_s)
             if len(self.items) > self.ROWS:
@@ -773,7 +784,7 @@ class App:
                 by = TOP_H + 2 + (h - bh) * self.top // max(1, len(self.items) - self.ROWS)
                 d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
         n = len(self.items) if self.items else 0
-        return self.chrome(img, f"{A['u']}{A['d']}:選ぶ ENTER:開く TAB:次へ ESC:終了  {n}件")
+        return self.chrome(img, f"{A['u']}{A['d']}:選ぶ ENTER:開く V:貼付用にする  {n}件")
 
     def run_detail(self, item):
         """全文表示(モーダル)"""
@@ -799,7 +810,7 @@ class App:
             when = datetime.datetime.fromtimestamp(item["created"]).strftime("%m/%d %H:%M")
             title = note or f"#{item['id']}  {item['source']}  {when}  {len(text)}文字"
             hint = ("もう一度 D で削除 / 他のキーで中止" if armed
-                    else f"{A['u']}{A['d']}:送り E:編集 S:保存 D:削除 ESC:戻る")
+                    else f"{A['u']}{A['d']}:送り V:貼付用 E:編集 S:保存 D:削除")
             self.fb.show(self.chrome(img, hint, tabs=False, title=title))
             for kind, val in nav(self.keys.poll(0.5)):
                 key = val.lower() if kind == "CHAR" else val
@@ -823,6 +834,9 @@ class App:
                     scroll += 1
                 elif key == "d":
                     armed = True
+                elif key == "v":
+                    self.make_paste_target(item)
+                    return
                 elif key == "s":
                     p = save_file(text, f"clip_{item['id']}.txt")
                     note = "保存: ~/clip/" + os.path.basename(p)
@@ -832,6 +846,20 @@ class App:
                         self.say(send_clip(out, "edit"))
                         return
                     self.keys.flush(0.1)
+
+    def make_paste_target(self, item):
+        if self.items and item["id"] == self.items[0]["id"]:
+            self.say("貼付用です  ESCで閉じて fn+V", 3)
+            return
+        new = to_top(item["id"])
+        if new:
+            self.last_id = max(self.last_id, new)
+            self.sel = 0
+            self.say(f"#{new} を貼付用に  ESCで閉じて fn+V", 3)
+            self.refresh_items()
+            self.sel = 0
+        else:
+            self.say("できませんでした")
 
     # ---- 3 QR
     def draw_qr(self):
@@ -955,6 +983,10 @@ class App:
                     break
                 if kind == "CHAR" and val in "1234":
                     self.set_mode(int(val) - 1)
+                    break
+                if (kind == "CHAR" and val.lower() == "v" and self.mode == M_HIST
+                        and self.items):
+                    self.make_paste_target(self.items[self.sel])
                     break
                 if kind != "ACT":
                     continue
