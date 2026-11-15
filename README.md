@@ -21,7 +21,7 @@ M5Stack **CardputerZero** 用の共有クリップボード + カメラOCR。
 | ファイル | 役割 |
 |---|---|
 | `czclipd.py` | 常駐サーバー。SQLite に履歴保存、`:8080` でスマホ用Web画面 (PIN認証)。標準ライブラリのみ |
-| `czclip` | CLI (`paste` / `push` / `list` / `get` / `rm` / `pin` / `logout-all`) |
+| `czclip` | CLI (`paste` / `push` / `list` / `get` / `rm` / `top` / `pin` / `qr` / `token` / `logout-all`) |
 | `ocr_cam.py` | 本体アプリ (クリップ / 履歴 / QR / 設定) |
 | `czpasted.py` | fn+V で最新のクリップをキー入力として貼り付ける常駐プログラム |
 | `hexaclip-ocr` | OCRアプリの起動スクリプト (ランチャーから起動時は `~/.local/share/hexaclip/ocr.log` にログ) |
@@ -48,6 +48,7 @@ czclip list                # 履歴
 czclip paste 3             # 3番目に新しいもの
 czclip top 12              # #12 を最新に移す (fn+V の対象にする)
 czclip pin                 # 接続URLとPINを表示
+czclip token               # 共有シート/ショートカット用のトークンと送り方を表示
 ```
 
 ### スマホの画面
@@ -75,16 +76,18 @@ hexaclip-ocr               # ホーム画面のアイコンと同じ
 
 | モード | 内容 | キー |
 |---|---|---|
-| 1 クリップ | カメラで読み取り → 修正 → 送る | `ENTER` 読取 / `↑↓` ズーム x1〜x3。枠の色とFOCUSバーでピント確認 (緑=良) |
+| 1 クリップ | カメラで読み取り → 修正 → 送る | `ENTER` 読取 (連写して一番シャープな1枚を使用) / `↑↓` ズーム x1〜x3。枠の色とFOCUSバーでピント確認 (緑=良) |
 | 2 履歴 | 受信・送信した内容の一覧 (先頭の `fn+V` 印が貼り付け対象) | `↑↓` 選ぶ / `V` 貼付用にする / `ENTER` 全文表示 → `E` 編集 `S` ファイル保存 (`~/clip/`) `D` 削除 |
 | 3 QR | スマホ接続用QR (読むだけでログイン) | SSHからは `czclip qr` |
-| 4 設定 | OCR言語 / 高精細撮影 / 起動時ズーム / 受信したら表示 | `↑↓` 選ぶ / `←→` 変える (すぐ保存) |
+| 4 設定 | OCR言語 (日本語/日+英/英語/コード) / 高精細撮影 / 連写枚数 / 自信のない文字 / 起動時ズーム / 受信したら表示 / fn+V の動作 | `↑↓` 選ぶ / `←→` 変える (すぐ保存) |
 
 共通の操作:
 
 - `TAB` 次のモード、`1`〜`4` で直接選択、`ESC` 戻る (一番上の画面では終了)
 - 方向キーは本体の流儀と同じ **F(↑) X(↓) Z(←) C(→)**。文字を打つ編集画面では `fn` を押しながら
-- 編集画面: 英数字で挿入 / `BS` 削除 / `TAB` 改行 / `ENTER` 送る / `ESC` 破棄
+- 編集画面: 英数字で挿入 / `BS` 削除 / `TAB` 改行 / `ENTER` 送る / `ESC` を2回で破棄
+- 読み取りに自信のない文字は橙色+下線で残ります (直すと色が消える)。設定で「消す」にもできます
+- 言語「コード」は、字下げに加えて単語間の空白の数も復元します
 - スマホなどから届くと「受信」と通知。設定で本文を自動表示にもできます
 
 メモ:
@@ -104,14 +107,31 @@ hexaclip-ocr               # ホーム画面のアイコンと同じ
 (`czpasted.py` / `hexaclip-paste.service`)。
 
 - 打てるのは英数字と記号だけ。日本語は飛ばします
-- 改行は ENTER として打たれます (CLIでは1行ずつ実行される)
+- 改行は ENTER として打たれます (CLIでは1行ずつ実行される)。末尾の改行は打ちません。
+  設定「fn+Vの改行」を「打たない」にすると、空白でつないで1行にまとめます
+- 履歴で `V` を押したとき、打てない文字 (日本語など) があれば件数を表示します
 - 打ち込み中に `ESC` で中止。最大4000文字
 - 本体は fn+V で `V` が入力されるため、貼り付け前に1文字消します (設定「fn+Vで入るVを消す」で OFF にできます)
 - 止める: `sudo systemctl disable --now hexaclip-paste`
 
+### 共有シート / ショートカットから送る
+
+ブラウザを開かずに送受信できます。`czclip token` で表示される内容を、iOSのショートカット
+(「URLの内容を取得」) や Android の HTTP 送信アプリに設定します。
+
+```
+送る:      POST http://<CPZ>:8080/api/items     本文=送りたい文字
+           Authorization: Bearer <TOKEN> / Content-Type: text/plain
+受け取る:  GET  http://<CPZ>:8080/api/latest    (同じ Authorization)
+```
+
+avahi が動いていれば `http://<ホスト名>.local:8080/` でも届きます (QR画面と `czclip pin` に表示)。
+
 ## セキュリティ
 
 - Web画面は同一LAN向け (HTTP)。6桁PIN、5回失敗で60秒ロック
+- トークン (`czclip token`) を知っている端末は読み書きできます。漏れたら `czclip token reset`
+- `hexaclip-paste` は一般ユーザー (input グループ) で動きます
 - `127.0.0.1` からのアクセスは認証不要 (CLI / OCR用)
 - PIN再発行と全端末ログアウト: `python3 ~/hexaclip/czclipd.py --reset-pin` → `sudo systemctl restart hexaclip`
 

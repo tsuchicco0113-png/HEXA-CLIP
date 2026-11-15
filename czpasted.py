@@ -5,13 +5,15 @@ CardputerZero には共通のクリップボードが無いため、本体キー
 キーイベントを書き込み、いま開いているアプリに1文字ずつ打ち込む。
 
   - 打てるのは英数字と記号 (US配列)。日本語などは飛ばす
-  - 改行は ENTER として打つ
+  - 改行は ENTER として打つ (設定で「打たない」にすると空白に置き換えて1行にまとめる)。
+    末尾の改行は打たない (シェルで勝手に実行されないように)
   - 打ち込み中に ESC を押すと中止
   - HEXA CLIP アプリの起動中は動かない (アプリがキーボードを独占するため)
 
-root で動かす (install.sh が hexaclip-paste.service として登録)。
+input グループのユーザーで動かす (install.sh が hexaclip-paste.service として登録)。
 """
 import argparse
+import fcntl
 import json
 import os
 import select
@@ -24,6 +26,7 @@ EV_SIZE = struct.calcsize(EV_FMT)
 EV_SYN, EV_KEY = 0, 1
 K_ESC, K_BS, K_TAB, K_ENTER, K_LSHIFT, K_SPACE = 1, 14, 15, 28, 42, 57
 MAX_CHARS = 4000
+EVIOCGKEY = 0x80000000 | (96 << 16) | (ord("E") << 8) | 0x18    # いま押されているキーの一覧
 
 _PAIRS = {
     2: "1!", 3: "2@", 4: "3#", 5: "4$", 6: "5%", 7: "6^", 8: "7&", 9: "8*", 10: "9(", 11: "0)",
@@ -39,10 +42,16 @@ for _code, _p in _PAIRS.items():
     CHARMAP[_p[1]] = (_code, True)
 
 
-def text_to_keys(text):
-    """文字列 → [(keycode, shift)], 打てなかった文字数"""
+def text_to_keys(text, newline="enter"):
+    """文字列 → [(keycode, shift)], 打てなかった文字数
+
+    newline: "enter" = 改行を ENTER として打つ / "none" = 空白に置き換える (1行にまとめる)
+    末尾の改行は打たない"""
     keys, skipped = [], 0
-    for ch in text.replace("\r\n", "\n").replace("\r", "\n")[:MAX_CHARS]:
+    text = text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+    if newline == "none":
+        text = " ".join(ln.strip() for ln in text.split("\n") if ln.strip())
+    for ch in text[:MAX_CHARS]:
         if ch in CHARMAP:
             keys.append(CHARMAP[ch])
         else:
@@ -63,10 +72,23 @@ def find_keyboard():
 
 
 class Paster:
-    def __init__(self, fd, fn_code, key_code, get_text, erase=lambda: False, delay=0.004):
+    def __init__(self, fd, fn_code, key_code, get_text, erase=lambda: False, delay=0.004,
+                 newline=lambda: "enter"):
         self.fd, self.fn, self.key = fd, fn_code, key_code
         self.get_text, self.erase, self.delay = get_text, erase, delay
+        self.newline = newline
         self.held = set()
+
+    def key_down(self, code):
+        """キーが本当に押されているか (デバイスの実状態)。
+
+        HEXA CLIP アプリがキーボードを独占している間はイベントが届かず、その間に fn を
+        離すと「押しっぱなし」と誤認して V だけで貼り付けが走るのを防ぐ"""
+        try:
+            buf = fcntl.ioctl(self.fd, EVIOCGKEY, bytes(96))
+            return bool(buf[code // 8] & (1 << (code % 8)))
+        except OSError:
+            return code in self.held        # 取れない環境では従来どおり
 
     # ---- I/O
     def read(self, timeout):
@@ -85,8 +107,14 @@ class Paster:
         return out
 
     def emit(self, code, value):
-        os.write(self.fd, struct.pack(EV_FMT, 0, 0, EV_KEY, code, value)
-                 + struct.pack(EV_FMT, 0, 0, EV_SYN, 0, 0))
+        data = (struct.pack(EV_FMT, 0, 0, EV_KEY, code, value)
+                + struct.pack(EV_FMT, 0, 0, EV_SYN, 0, 0))
+        for _ in range(50):
+            try:
+                os.write(self.fd, data)
+                break
+            except BlockingIOError:          # 一時的に書けない → 少し待って再試行
+                time.sleep(0.01)
         time.sleep(self.delay)
 
     def tap(self, code, shift=False):
@@ -107,15 +135,33 @@ class Paster:
             elif value == 1:
                 self.held.add(code)
                 if code == self.key and self.fn in self.held:
-                    hit = True
+                    if self.key_down(self.fn):
+                        hit = True
+                    else:
+                        self.held.discard(self.fn)
         return hit
+
+    def drain(self):
+        """たまったイベント(自分の打鍵の戻りを含む)を全部読み、ESC が押されていたら True"""
+        esc = False
+        while True:
+            ev = self.read(0)
+            if not ev:
+                return esc
+            esc = esc or any(c == K_ESC and v == 1 for c, v in ev)
 
     def wait_release(self, timeout=3.0):
         """fn と V が離されるまで待つ (fn を押したまま打つと別の操作になるため)"""
         end = time.time() + timeout
-        while (self.fn in self.held or self.key in self.held) and time.time() < end:
+        def down():
+            return self.key_down(self.fn) or self.key_down(self.key)
+        while down() and time.time() < end:
             self.track(self.read(0.05))
-        return not (self.fn in self.held or self.key in self.held)
+        if down():
+            return False
+        self.held.discard(self.fn)
+        self.held.discard(self.key)
+        return True
 
     def paste(self):
         if not self.wait_release():
@@ -123,20 +169,21 @@ class Paster:
         text = self.get_text()
         if not text:
             return "empty"
-        keys, skipped = text_to_keys(text)
+        keys, skipped = text_to_keys(text, self.newline())
+        cut = max(0, len(text.rstrip("\n")) - MAX_CHARS)
+        self.drain()
         if self.erase():
             self.tap(K_BS)                       # ホットキーで入ってしまった v を消す
         for n, (code, shift) in enumerate(keys):
-            if n % 8 == 0:                       # 自分の打鍵を読み捨てつつ、ESC(中止)を見る
-                for c, v in self.read(0):
-                    if c == K_ESC and v == 1:
-                        self.held.clear()
-                        return f"aborted at {n}/{len(keys)}"
+            if n % 8 == 0 and self.drain():      # 自分の打鍵を読み捨てつつ、ESC(中止)を見る
+                self.held.clear()
+                return f"aborted at {n}/{len(keys)}"
             self.tap(code, shift)
         time.sleep(0.05)
-        self.read(0)
+        self.drain()
         self.held.clear()
-        return f"typed {len(keys)} keys, skipped {skipped}"
+        return (f"typed {len(keys)} keys, skipped {skipped}"
+                + (f", cut {cut} (max {MAX_CHARS})" if cut else ""))
 
     def run(self):
         while True:
@@ -161,16 +208,25 @@ def main():
             print("fetch failed:", e, flush=True)
             return ""
 
-    def erase():
+    def setting(key, default):
         try:
-            return bool(json.load(open(a.settings)).get("paste_erase", True))
+            return json.load(open(a.settings)).get(key, default)
         except Exception:
-            return True                 # 本体は fn+V で V が入力されるため、既定で消す
+            return default
+
+    def erase():
+        return bool(setting("paste_erase", True))   # 本体は fn+V で V が入力されるため、既定で消す
+
+    def newline():
+        return "none" if setting("paste_newline", "enter") == "none" else "enter"
 
     dev = find_keyboard()
-    fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)
-    print(f"czpasted: {dev}  hotkey fn({a.fn})+key({a.key})", flush=True)
-    Paster(fd, a.fn, a.key, get_text, erase).run()
+    try:
+        fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)
+    except PermissionError:
+        raise SystemExit(f"czpasted: {dev} を開けません。input グループのユーザーか root で実行してください")
+    print(f"czpasted: {dev}  hotkey fn({a.fn})+key({a.key})  uid={os.getuid()}", flush=True)
+    Paster(fd, a.fn, a.key, get_text, erase, newline=newline).run()
 
 
 if __name__ == "__main__":

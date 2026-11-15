@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v0.7)
+"""HEXA CLIP — CardputerZero 用アプリ (v0.7.1)
 
 4つのモードを上のタブで切り替える:
   1 クリップ : カメラで文字を読み取り → 修正 → HEXA CLIPへ送る
@@ -37,7 +37,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.7"
+VERSION = "0.7.1"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -79,6 +79,7 @@ SETTING_DEFS = [
     ("zoom", "起動時のズーム", [0, 1, 2], ["x1", "x2", "x3"]),
     ("auto_show", "受信したら表示", [False, True], ["OFF (通知のみ)", "ON (本文を開く)"]),
     ("paste_erase", "fn+Vで入るVを消す", [True, False], ["ON", "OFF"]),
+    ("paste_newline", "fn+Vの改行", ["enter", "none"], ["ENTERで打つ", "打たない (1行に)"]),
 ]
 
 
@@ -127,6 +128,22 @@ ACTIONS = {K_UP: "UP", K_DOWN: "DOWN", K_LEFT: "LEFT", K_RIGHT: "RIGHT", K_HOME:
 KNOWN = set(CHARS) | set(ACTIONS) | {K_LSHIFT, K_RSHIFT, K_CAPS}
 FN_ARROWS = {33: "UP", 45: "DOWN", 44: "LEFT", 46: "RIGHT"}     # fn + F / X / Z / C
 LETTER_NAV = {"f": "UP", "x": "DOWN", "z": "LEFT", "c": "RIGHT"}
+
+
+PASTE_MAX = 4000                                               # czpasted.py と同じ
+PASTEABLE = set("".join(CHARS.values())) | {" ", "\n", "\t"}
+
+
+def paste_note(text):
+    """fn+V で打てない分の説明 ("" なら全部打てる)"""
+    text = text.rstrip("\n")
+    bad = sum(1 for ch in text[:PASTE_MAX] if ch not in PASTEABLE)
+    notes = []
+    if bad:
+        notes.append(f"日本語など{bad}字は打てません")
+    if len(text) > PASTE_MAX:
+        notes.append(f"{PASTE_MAX}字まで")
+    return " / ".join(notes)
 
 
 def nav(events):
@@ -1062,14 +1079,15 @@ class App:
                     self.keys.flush(0.1)
 
     def make_paste_target(self, item):
+        note = paste_note(clip_get(item)["text"])
         if self.items and item["id"] == self.items[0]["id"]:
-            self.say("貼付用です  ESCで閉じて fn+V", 3)
+            self.say(note or "貼付用です  ESCで閉じて fn+V", 4 if note else 3)
             return
         new = to_top(item["id"])
         if new:
             self.last_id = max(self.last_id, new)
             self.sel = 0
-            self.say(f"#{new} を貼付用に  ESCで閉じて fn+V", 3)
+            self.say(f"#{new} を貼付用に  " + (note or "ESCで閉じて fn+V"), 4 if note else 3)
             self.refresh_items()
             self.sel = 0
         else:

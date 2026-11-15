@@ -47,12 +47,21 @@ sudo systemctl enable --now hexaclip
 sudo systemctl restart hexaclip
 
 echo "== paste service (fn+V で貼り付け)"
-sudo tee /etc/systemd/system/hexaclip-paste.service >/dev/null <<EOF
+# まず一般ユーザー(inputグループ)で動かす。キーボードを開けない場合だけ root に戻す
+write_paste_unit() {   # $1 = "user" または "root"
+  if [ "$1" = "user" ]; then
+    RUNAS="User=$U
+SupplementaryGroups=input"
+  else
+    RUNAS=""
+  fi
+  sudo tee /etc/systemd/system/hexaclip-paste.service >/dev/null <<EOF
 [Unit]
 Description=HEXA CLIP paste hotkey (fn+V)
 After=hexaclip.service
 
 [Service]
+$RUNAS
 ExecStart=/usr/bin/python3 $DIR/czpasted.py --settings /home/$U/.config/hexaclip/settings.json
 Restart=on-failure
 RestartSec=3
@@ -60,9 +69,16 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-sudo systemctl daemon-reload
-sudo systemctl enable hexaclip-paste >/dev/null 2>&1
-sudo systemctl restart hexaclip-paste
+  sudo systemctl daemon-reload
+  sudo systemctl enable hexaclip-paste >/dev/null 2>&1
+  sudo systemctl restart hexaclip-paste
+}
+write_paste_unit user
+sleep 2
+if ! systemctl is-active --quiet hexaclip-paste; then
+  echo "   (一般ユーザーではキーボードを開けないため root で動かします)"
+  write_paste_unit root
+fi
 
 if [ -d "$APPL/applications" ]; then
   echo "== launcher (APPLaunch)"
