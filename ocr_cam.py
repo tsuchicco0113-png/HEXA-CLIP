@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v1.1)
+"""HEXA CLIP — CardputerZero 用アプリ (v1.2)
 
 スマホやPCから送ったコード・資料を受け取って、本体で使う (fn+V で打ち込む / ~/clip/ に置く)。
 
@@ -42,7 +42,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-VERSION = "1.1"
+VERSION = "1.2"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -926,6 +926,16 @@ def draw_icon(d, kind, cx, cy, s, col):
         d.ellipse((cx - s * 0.12, cy - s * 0.12, cx + s * 0.12, cy + s * 0.12), fill=col)
 
 
+def fit_font(size, max_w, words):
+    """words が全部 max_w に収まる大きさまで文字を小さくする (本体のフォントは字幅が広め)"""
+    while size > 8:
+        font, _ = find_font(size)
+        if max(font.getlength(w) for w in words) <= max_w:
+            return font
+        size -= 1
+    return find_font(size)[0]
+
+
 MASCOT_H = LCD_H - TOP_H - BOT_H - 2      # 全身を縦いっぱいに (顔が分かる大きさ)
 MASCOT_MAX_W = 66                          # これより横に広いポーズは小さめに
 
@@ -991,6 +1001,7 @@ class App:
         self.font_b, _ = find_font(19, bold=True)
         self.font_bs, _ = find_font(11, bold=True)
         self.font_t, _ = find_font(10)
+        self.font_hex = fit_font(11, 40, ["履歴", "接続", "カメラ", "設定"])   # 六角形に収まる大きさ
         self.mascot = load_mascot()
         self.honey = honeycomb_bg()
         self.cam_on = False                 # カメラは「カメラ」画面でだけ動かす
@@ -1013,9 +1024,8 @@ class App:
         d = ImageDraw.Draw(img)
         d.rectangle((0, 0, LCD_W, TOP_H - 1), fill=(0, 0, 0))
         if tabs:                            # HEXA STAGE 風のヘッダー
-            d.polygon(hexpts(9, 9, 6), outline=ACC, width=2)
-            d.text((19, 1), "HEXA CLIP", fill=ACC, font=self.font_bs)
-            x = 19 + self.font_bs.getlength("HEXA CLIP") + 6
+            d.text((5, 1), "HEXA CLIP", fill=ACC, font=self.font_bs)
+            x = 5 + self.font_bs.getlength("HEXA CLIP") + 6
             if self.mode != M_HOME:            # 「›」はフォントに無いことがあるので線で描く
                 d.line((x + 1, 5, x + 4, 9, x + 1, 13), fill=SUB, width=2)
                 d.text((x + 10, 1), SCREEN_NAMES[self.mode], fill=FG, font=self.font_s)
@@ -1090,7 +1100,8 @@ class App:
         self.set_mode(m)
 
     # ---- ホーム (ハニカム)
-    HOME_POS = [(40, 62), (92, 62), (66, 108), (118, 108)]    # 2x2 のハニカム
+    HEX_R = 32                                                # 六角形の大きさ (中心から角まで)
+    HOME_POS = [(34, 60), (94, 60), (64, 112), (124, 112)]    # 2x2 のハニカム
     HOME_DESC = {M_HIST: "受け取ったもの", M_QR: "スマホ・PCと",
                  M_CLIP: "文字・QR (おまけ)", M_SET: "受信・fn+V・カメラ"}
 
@@ -1125,24 +1136,26 @@ class App:
         for i, m in enumerate(SCREENS):
             cx, cy = self.HOME_POS[i]
             on = m == sel
-            pts = hexpts(cx, cy, 27)
+            r = self.HEX_R
+            pts = hexpts(cx, cy, r)
             d.polygon(pts, fill=(20, 32, 30) if on else (18, 21, 29))
             if on:
-                glow_hex(img, cx, cy, 27, ACC)
+                glow_hex(img, cx, cy, r, ACC)
                 d = ImageDraw.Draw(img)
             else:
                 d.polygon(pts, outline=(44, 50, 64), width=2)
-            draw_icon(d, m, cx, cy - 4, 15, ACC if on else SUB)
+            draw_icon(d, m, cx, cy - 8, 15, ACC if on else SUB)
             name = SCREEN_NAMES[m]
-            tw = self.font_t.getlength(name)
-            d.text((cx - tw / 2, cy + 8), name, fill=FG if on else SUB, font=self.font_t)
+            f = self.font_hex
+            tw = f.getlength(name)
+            d.text((cx - tw / 2, cy + 5), name, fill=FG if on else SUB, font=f)
             if m == M_HIST and self.unseen:      # 新着の数
-                bx, by = cx + 17, cy - 21
+                bx, by = cx + 21, cy - 25
                 d.ellipse((bx - 8, by - 8, bx + 8, by + 8), fill=(255, 170, 40))
                 n = str(min(self.unseen, 99))
                 d.text((bx - self.font_t.getlength(n) / 2, by - 7), n, fill=(20, 20, 20), font=self.font_t)
         # 右の説明パネル (ゴマエビちゃんがいれば、その左までに収める)
-        x0 = 156
+        x0 = 162
         mw = max(m.width for m in self.mascot.values()) if self.mascot else 0
         right = LCD_W - 6 - (mw + 2 if mw else 0)
         d.text((x0, 22), SCREEN_NAMES[sel], fill=FG, font=self.font_b)
