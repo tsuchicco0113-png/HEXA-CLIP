@@ -4,28 +4,36 @@
 usage: python3 make_icon.py OUT.png [SIZE | REFERENCE.png]
   REFERENCE.png を渡すと、そのPNGと同じサイズで作る(既存アイコンに合わせる)
 """
+import math
 import sys
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
+
+
+def hexpts(cx, cy, r):
+    return [(cx + r * math.cos(math.radians(60 * i + 30)), cy + r * math.sin(math.radians(60 * i + 30)))
+            for i in range(6)]
 
 
 def make(size):
+    """HEXA STAGE 風: 光る緑の六角形の中にクリップボード"""
     s = size * 4                                    # 4倍で描いて縮小(アンチエイリアス)
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
     u = s / 100
-    d.rounded_rectangle((4 * u, 4 * u, 96 * u, 96 * u), 20 * u, fill=(22, 26, 34, 255))
     green = (47, 214, 123, 255)
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    # 外側の光
+    glow = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    pts = hexpts(50 * u, 50 * u, 44 * u)
+    ImageDraw.Draw(glow).line(pts + [pts[0]], fill=(47, 214, 123, 200), width=int(10 * u))
+    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(4 * u)))
+    d = ImageDraw.Draw(img)
+    d.polygon(hexpts(50 * u, 50 * u, 44 * u), fill=(16, 22, 26, 255))
+    d.line(pts + [pts[0]], fill=green, width=int(4 * u), joint="curve")
     # クリップボード
-    d.rounded_rectangle((22 * u, 20 * u, 78 * u, 86 * u), 8 * u, outline=green, width=int(6 * u))
-    d.rounded_rectangle((36 * u, 12 * u, 64 * u, 28 * u), 5 * u, fill=green)
-    # テキスト行
-    for y, w in ((42, 40), (54, 32), (66, 22)):
-        d.rounded_rectangle((32 * u, y * u, (32 + w) * u, (y + 5) * u), 2.5 * u,
-                            fill=(232, 234, 240, 255))
-    # カメラレンズ
-    d.ellipse((58 * u, 58 * u, 84 * u, 84 * u), fill=(22, 26, 34, 255), outline=green, width=int(5 * u))
-    d.ellipse((67 * u, 67 * u, 75 * u, 75 * u), fill=green)
+    d.rounded_rectangle((31 * u, 27 * u, 69 * u, 76 * u), 5 * u, outline=green, width=int(4 * u))
+    d.rounded_rectangle((41 * u, 21 * u, 59 * u, 31 * u), 3 * u, fill=green)
+    for y, w in ((40, 26), (50, 20), (60, 14)):
+        d.rounded_rectangle((38 * u, y * u, (38 + w) * u, (y + 4) * u), 2 * u, fill=(232, 234, 240, 255))
     return img.resize((size, size), Image.LANCZOS)
 
 

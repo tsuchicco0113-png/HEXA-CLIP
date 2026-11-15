@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v1.0)
+"""HEXA CLIP — CardputerZero 用アプリ (v1.1)
 
 スマホやPCから送ったコード・資料を受け取って、本体で使う (fn+V で打ち込む / ~/clip/ に置く)。
 
-4つの画面を上のタブで切り替える:
+起動するとハニカムのホーム画面。六角形を選んで ENTER (1〜4 キーで直接も):
   1 履歴   : 受け取ったものの一覧 → ENTER で全文 → ENTER でメニュー
              (貼付用 / 編集 / 保存 / 実行 / QRで表示 / ピン留め / 削除)
   2 接続   : スマホ接続用のQRコード (読むだけでログイン)
   3 カメラ : おまけ。本体カメラで文字やQRを読む (カメラは この画面でだけ動く)
   4 設定   : 受信時の動き / fn+V の改行 / カメラの設定
+ホームには fn+V で貼れる内容と新着の数、assets/mascot/ に絵があればゴマエビちゃんが出る
 
 共通の操作:
-  TAB = 次のモード   1〜4 = モードを直接選択   ESC = 戻る (一番上の画面では確認のうえ終了)
+  ESC = ホームへ戻る (ホームでは確認のうえ終了)   1〜4 = 画面を直接選択   TAB = 次の画面
   方向キー = F(↑) X(↓) Z(←) C(→)   ※本体の流儀と同じ。文字入力画面では fn を押しながら
   画面下に、その画面で使えるキーを常に表示
 
@@ -29,6 +30,7 @@ import datetime
 import fcntl
 import glob
 import json
+import math
 import os
 import select
 import signal
@@ -38,9 +40,9 @@ import time
 import urllib.request
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-VERSION = "1.0"
+VERSION = "1.1"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -294,8 +296,8 @@ class FrameBuffer:
         self.show(Image.new("RGB", (LCD_W, LCD_H)))
 
 
-def find_font(size):
-    """日本語フォントを探す(細すぎるウェイトは後回し)"""
+def find_font(size, bold=False):
+    """日本語フォントを探す(細すぎるウェイトは後回し)。bold=True なら太いウェイトを優先"""
     cands = []
     for p in ["/usr/share/APPLaunch/**/*.tt[fc]", "/usr/share/APPLaunch/**/*.otf",
               "/usr/share/fonts/**/*CJK*", "/usr/share/fonts/**/*[Ii][Pp][Aa]*",
@@ -306,7 +308,10 @@ def find_font(size):
         n = os.path.basename(f).lower()
         if "serif" in n:
             return 50
-        for i, w in enumerate(["medium", "65", "regular", "55", "bold", "75", "black", "light", "thin"]):
+        order = (["bold", "85", "heavy", "75", "black", "medium", "65", "regular", "55", "light", "thin"]
+                 if bold else
+                 ["medium", "65", "regular", "55", "bold", "75", "black", "light", "thin"])
+        for i, w in enumerate(order):
             if w in n:
                 return i
         return 5
@@ -867,9 +872,98 @@ class Editor:
         return img
 
 
+# ---------------------------------------------------------------- HEXA STAGE 風の部品
+def hexpts(cx, cy, r, rot=30):
+    """六角形の頂点 (rot=30 で上下が尖る向き)"""
+    return [(cx + r * math.cos(math.radians(60 * i + rot)),
+             cy + r * math.sin(math.radians(60 * i + rot))) for i in range(6)]
+
+
+def honeycomb_bg():
+    """ホーム画面の背景 (うっすらハニカム)。起動時に1回だけ作る"""
+    img = Image.new("RGB", (LCD_W, LCD_H), BG)
+    d = ImageDraw.Draw(img)
+    for row in range(-1, 8):
+        for col in range(-1, 12):
+            cx = col * 30 + (15 if row % 2 else 0)
+            cy = 20 + row * 26
+            d.polygon(hexpts(cx, cy, 17), outline=(20, 24, 34))
+    return img
+
+
+def glow_hex(img, cx, cy, r, col):
+    """光る六角形の枠 (ぼかした太線 + 細線)"""
+    g = Image.new("RGB", img.size, (0, 0, 0))
+    pts = hexpts(cx, cy, r)
+    ImageDraw.Draw(g).line(pts + [pts[0]], fill=col, width=6)
+    g = g.filter(ImageFilter.GaussianBlur(3))
+    img.paste(ImageChops.lighter(img, g))
+    ImageDraw.Draw(img).line(pts + [pts[0]], fill=col, width=2)
+
+
+def draw_icon(d, kind, cx, cy, s, col):
+    """ホームの六角形の中の線画アイコン"""
+    if kind == M_HIST:                       # 一覧
+        for i, w in enumerate((1.0, 0.75, 0.9)):
+            y = cy - s * 0.45 + i * s * 0.45
+            d.rounded_rectangle((cx - s * 0.55, y - s * 0.1, cx - s * 0.55 + s * 1.1 * w, y + s * 0.1),
+                                2, fill=col)
+    elif kind == M_QR:                       # つながる
+        for ox in (-0.28, 0.28):
+            d.rounded_rectangle((cx + ox * s - s * 0.38, cy - s * 0.2, cx + ox * s + s * 0.38,
+                                 cy + s * 0.2), int(s * 0.2), outline=col, width=2)
+    elif kind == M_CLIP:                     # カメラ
+        d.rounded_rectangle((cx - s * 0.6, cy - s * 0.38, cx + s * 0.6, cy + s * 0.45), 4,
+                            outline=col, width=2)
+        d.rectangle((cx - s * 0.22, cy - s * 0.55, cx + s * 0.22, cy - s * 0.38), fill=col)
+        d.ellipse((cx - s * 0.24, cy - s * 0.18, cx + s * 0.24, cy + s * 0.3), outline=col, width=2)
+    else:                                    # 歯車
+        for i in range(8):
+            a = math.radians(45 * i)
+            d.line((cx + math.cos(a) * s * 0.3, cy + math.sin(a) * s * 0.3,
+                    cx + math.cos(a) * s * 0.58, cy + math.sin(a) * s * 0.58), fill=col, width=3)
+        d.ellipse((cx - s * 0.38, cy - s * 0.38, cx + s * 0.38, cy + s * 0.38), outline=col, width=2)
+        d.ellipse((cx - s * 0.12, cy - s * 0.12, cx + s * 0.12, cy + s * 0.12), fill=col)
+
+
+MASCOT_H = 58
+
+
+def load_mascot():
+    """assets/mascot/ の立ち絵 (ゴマエビちゃん)。idle.png = ふだん / happy.png = 受信した時
+    無ければ何も出さない。白ふち付きの透過PNGをそのまま置けば、本体用に縮める"""
+    out = {}
+    for key in ("idle", "happy"):
+        p = os.path.join(ASSET_DIR, "mascot", key + ".png")
+        try:
+            im = Image.open(p).convert("RGBA")
+            bbox = im.getbbox()
+            if bbox:
+                im = im.crop(bbox)
+            k = MASCOT_H / im.height
+            out[key] = im.resize((max(1, int(im.width * k)), MASCOT_H), Image.LANCZOS)
+        except (OSError, ValueError):
+            pass
+    if "happy" not in out and "idle" in out:
+        out["happy"] = out["idle"]
+    return out
+
+
+def battery_percent():
+    for p in glob.glob("/sys/class/power_supply/*/capacity"):
+        try:
+            return int(open(p).read().strip())
+        except (OSError, ValueError):
+            pass
+    return None
+
+
 # ---------------------------------------------------------------- app
-MODES = ["履歴", "接続", "カメラ", "設定"]
-M_HIST, M_QR, M_CLIP, M_SET = range(4)
+M_HOME, M_HIST, M_QR, M_CLIP, M_SET = range(5)
+SCREENS = [M_HIST, M_QR, M_CLIP, M_SET]          # ホームの六角形の並び (1〜4キーでも直接)
+SCREEN_NAMES = {M_HIST: "履歴", M_QR: "接続", M_CLIP: "カメラ", M_SET: "設定"}
+ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+GLOW = (0, 60, 36)                                # 選択中の六角形の内側
 
 
 class App:
@@ -886,7 +980,17 @@ class App:
         if args.lang:
             self.st["lang"] = args.lang
         self.pv = Preview(self.st["zoom"])
-        self.mode = M_HIST                  # 最初は履歴 (受け取ったもの)
+        self.mode = M_HOME                  # 最初はホーム (ハニカム)
+        self.home_sel = 0
+        self.unseen = 0                     # ホームの「新着」 (履歴を開くと0)
+        self.happy_until = 0.0              # ゴマエビちゃんが喜んでいる時間
+        self.status = {"t": 0.0}
+        self.home_cache = (None, None)
+        self.font_b, _ = find_font(19, bold=True)
+        self.font_bs, _ = find_font(11, bold=True)
+        self.font_t, _ = find_font(10)
+        self.mascot = load_mascot()
+        self.honey = honeycomb_bg()
         self.cam_on = False                 # カメラは「カメラ」画面でだけ動かす
         self.toast = ("", 0.0)
         self.items, self.sel, self.top = [], 0, 0
@@ -906,27 +1010,27 @@ class App:
     def chrome(self, img, hint, tabs=True, title=None):
         d = ImageDraw.Draw(img)
         d.rectangle((0, 0, LCD_W, TOP_H - 1), fill=(0, 0, 0))
-        if tabs:
-            w = LCD_W // len(MODES)
-            for i, name in enumerate(MODES):
-                on = i == self.mode
-                if on:
-                    d.rectangle((i * w, 0, (i + 1) * w - 1, TOP_H - 1), fill=BAR)
-                label = f"{i + 1} {name}"
-                tw = self.font_s.getlength(label)
-                d.text((i * w + (w - tw) / 2, 1), label, fill=(255, 255, 255) if on else SUB,
-                       font=self.font_s)
+        if tabs:                            # HEXA STAGE 風のヘッダー
+            d.polygon(hexpts(9, 9, 6), outline=ACC, width=2)
+            d.text((19, 1), "HEXA CLIP", fill=ACC, font=self.font_bs)
+            x = 19 + self.font_bs.getlength("HEXA CLIP") + 6
+            if self.mode != M_HOME:            # 「›」はフォントに無いことがあるので線で描く
+                d.line((x + 1, 5, x + 4, 9, x + 1, 13), fill=SUB, width=2)
+                d.text((x + 10, 1), SCREEN_NAMES[self.mode], fill=FG, font=self.font_s)
+            st = self.status_text()
+            d.text((LCD_W - 4 - self.font_t.getlength(st), 2), st, fill=SUB, font=self.font_t)
         else:
             d.rectangle((0, 0, LCD_W, TOP_H - 1), fill=BAR)
             d.text((4, 1), title or "", fill=(255, 255, 255), font=self.font_s)
         d.rectangle((0, LCD_H - BOT_H, LCD_W, LCD_H), fill=(0, 0, 0))
         d.text((4, LCD_H - BOT_H + 1), hint, fill=(210, 210, 210), font=self.font_s)
         msg, until = self.toast
-        if msg and time.time() < until:
+        if msg and time.time() < until:      # お知らせは下のキー案内のすぐ上に
             w = int(self.font_s.getlength(msg)) + 16
-            d.rounded_rectangle(((LCD_W - w) // 2, TOP_H + 4, (LCD_W + w) // 2, TOP_H + 24), 8,
-                                fill=(0, 120, 70))
-            d.text(((LCD_W - w) // 2 + 8, TOP_H + 6), msg, fill=(255, 255, 255), font=self.font_s)
+            y = LCD_H - BOT_H - 24
+            d.rounded_rectangle(((LCD_W - w) // 2, y, (LCD_W + w) // 2, y + 20), 8,
+                                fill=(0, 120, 70), outline=ACC)
+            d.text(((LCD_W - w) // 2 + 8, y + 2), msg, fill=(255, 255, 255), font=self.font_s)
         return img
 
     def say(self, msg, sec=2.5):
@@ -970,10 +1074,112 @@ class App:
         self.cam_on = on
 
     def set_mode(self, m):
-        self.mode = m % len(MODES)
-        self.set_cam(self.mode == M_CLIP)
+        """画面を切り替える。カメラはカメラ画面でだけ動かす"""
+        self.mode = m
+        if m == M_HIST:
+            self.unseen = 0
+        self.set_cam(m == M_CLIP)
         self.qr_img = None
         self.next_list = 0.0
+
+    def open_screen(self, m):
+        """ホームや 1〜4 キーから各画面へ"""
+        self.home_sel = SCREENS.index(m)
+        self.set_mode(m)
+
+    # ---- ホーム (ハニカム)
+    HOME_POS = [(52, 62), (104, 62), (78, 108), (130, 108)]   # 2x2 のハニカム
+    HOME_DESC = {M_HIST: "受け取ったもの", M_QR: "スマホ・PCをつなぐ",
+                 M_CLIP: "おまけ: 文字・QRを読む", M_SET: "受信 / fn+V / カメラ"}
+
+    def status_text(self):
+        """右上: Wi-Fi (IPの末尾) と電池。15秒ごとに取り直す"""
+        if time.time() - self.status["t"] > 15:
+            self.status = {"t": time.time(), "bat": battery_percent()}
+            try:
+                info = clip_call("GET", "/api/pin", timeout=0.8)
+                ip = info["url"].split("//")[1].split(":")[0]
+                self.status["net"] = ("Wi-Fi ." + ip.split(".")[-1]) if info.get("online") else "Wi-Fi なし"
+            except Exception:
+                self.status["net"] = "CLIP停止中"
+        st = self.status.get("net", "")
+        if self.status.get("bat") is not None:
+            st += f"  {self.status['bat']}%"
+        return st
+
+    def draw_home(self):
+        latest = None
+        if self.items:
+            latest = next((i for i in self.items if i["id"] == CLIP_LATEST[0]), None)
+        happy = time.time() < self.happy_until
+        key = (self.home_sel, self.unseen, latest and latest["id"], happy, len(self.items or []),
+               self.status_text(), self.cam is None, self.items is None)
+        if self.home_cache[0] == key:
+            img = self.home_cache[1].copy()
+            return self.chrome(img, self.home_hint())
+        img = self.honey.copy()
+        d = ImageDraw.Draw(img)
+        sel = SCREENS[self.home_sel]
+        for i, m in enumerate(SCREENS):
+            cx, cy = self.HOME_POS[i]
+            on = m == sel
+            pts = hexpts(cx, cy, 27)
+            d.polygon(pts, fill=(20, 32, 30) if on else (18, 21, 29))
+            if on:
+                glow_hex(img, cx, cy, 27, ACC)
+                d = ImageDraw.Draw(img)
+            else:
+                d.polygon(pts, outline=(44, 50, 64), width=2)
+            draw_icon(d, m, cx, cy - 4, 15, ACC if on else SUB)
+            name = SCREEN_NAMES[m]
+            tw = self.font_t.getlength(name)
+            d.text((cx - tw / 2, cy + 8), name, fill=FG if on else SUB, font=self.font_t)
+            if m == M_HIST and self.unseen:      # 新着の数
+                bx, by = cx + 17, cy - 21
+                d.ellipse((bx - 8, by - 8, bx + 8, by + 8), fill=(255, 170, 40))
+                n = str(min(self.unseen, 99))
+                d.text((bx - self.font_t.getlength(n) / 2, by - 7), n, fill=(20, 20, 20), font=self.font_t)
+        # 右の説明パネル
+        x0 = 170
+        d.text((x0, 22), SCREEN_NAMES[sel], fill=FG, font=self.font_b)
+        desc = self.HOME_DESC[sel]
+        if sel == M_HIST and self.items is not None:
+            desc += f" {len(self.items)}件"
+        if sel == M_CLIP and self.cam is None:
+            desc = "カメラが見つかりません"
+        if self.items is None:
+            desc = "HEXA CLIP が停止中"
+        d.text((x0, 50), desc, fill=SUB, font=self.font_s)
+        d.line((x0, 68, LCD_W - 6, 68), fill=(44, 50, 64))
+        right = LCD_W - 6 - (self.mascot["idle"].width + 4 if self.mascot else 0)
+        d.text((x0, 72), "fn+V で貼れる", fill=ACC, font=self.font_t)
+        d.rounded_rectangle((x0, 87, max(x0 + 60, right), 117), 4, fill=(18, 22, 30), outline=(44, 50, 64))
+        if latest:
+            head = latest.get("name") or latest["text"]
+            d.text((x0 + 5, 89), self.ellipsize(head, max(40, right - x0 - 10)), fill=FG, font=self.font_s)
+            when = datetime.datetime.fromtimestamp(latest["created"]).strftime("%H:%M")
+            d.text((x0 + 5, 104), f"{latest['source']} · {when}", fill=SUB, font=self.font_t)
+        else:
+            d.text((x0 + 5, 95), "まだありません", fill=SUB, font=self.font_s)
+        if self.unseen:
+            d.text((x0, 124), f"● 新着 {self.unseen}件", fill=(255, 190, 70), font=self.font_bs)
+        if self.mascot:                          # ゴマエビちゃん
+            m = self.mascot["happy" if happy else "idle"]
+            img.paste(m, (LCD_W - m.width - 3, LCD_H - BOT_H - m.height - 1), m)
+        self.home_cache = (key, img.copy())
+        return self.chrome(img, self.home_hint())
+
+    def home_hint(self):
+        A = self.AR
+        return f"{A['u']}{A['d']}{A['l']}{A['r']}:選ぶ  ENTER:開く  1〜4:直接  ESC:終了"
+
+    def home_move(self, val):
+        r, c = divmod(self.home_sel, 2)
+        if val in ("LEFT", "RIGHT"):
+            c = 1 - c
+        elif val in ("UP", "DOWN"):
+            r = 1 - r
+        self.home_sel = r * 2 + c
 
     # ---- 1 クリップ
     def draw_clip(self):
@@ -984,9 +1190,9 @@ class App:
             d.text((10, 44), "カメラが見つかりません", fill=FG, font=self.font)
             d.text((10, 74), "文字の読み取りは、スマホ画面の", fill=SUB, font=self.font_s)
             d.text((10, 92), "「撮って読む」を使ってください", fill=SUB, font=self.font_s)
-            return self.chrome(img, "TAB:次の画面  ESC:終了")
+            return self.chrome(img, "ESC:ホーム")
         img = self.pv.frame(self.cam)
-        self.chrome(img, f"ENTER:文字 Q:QR {A['u']}{A['d']}:x{self.pv.zoom + 1}")
+        self.chrome(img, f"ENTER:文字 Q:QR {A['u']}{A['d']}:x{self.pv.zoom + 1} ESC")
         d = ImageDraw.Draw(img)
         bx = 226
         d.text((bx - 40, LCD_H - BOT_H + 1), "FOCUS", fill=SUB, font=self.font_s)
@@ -1116,7 +1322,7 @@ class App:
         n = len(self.items) if self.items else 0
         if self.query:
             return self.chrome(img, f"検索「{self.query}」{n}件  /:変更 ESC:解除")
-        return self.chrome(img, f"{A['u']}{A['d']}:選ぶ  ENTER:開く  /:検索   {n}件")
+        return self.chrome(img, f"{A['u']}{A['d']}:選ぶ ENTER:開く /:検索 ESC:ホーム {n}件")
 
     def toggle_pin(self, item):
         on = not item.get("pinned")
@@ -1572,7 +1778,7 @@ class App:
     def draw_qr(self):
         if self.qr_img is None:
             self.qr_img = self.build_qr()
-        return self.chrome(self.qr_img.copy(), "スマホでQRを読む(同じWi-Fi) TAB:次へ ESC:終了")
+        return self.chrome(self.qr_img.copy(), "スマホでQRを読む (同じWi-Fi)   ESC:ホーム")
 
     def build_qr(self):
         img = self.canvas()
@@ -1651,7 +1857,7 @@ class App:
             bh = max(8, h * rows // len(SETTING_DEFS))
             by = TOP_H + 2 + (h - bh) * top // max(1, len(SETTING_DEFS) - rows)
             d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
-        return self.chrome(img, f"{A['u']}{A['d']}:選ぶ {A['l']}{A['r']}:変える(すぐ保存) ESC:終了")
+        return self.chrome(img, f"{A['u']}{A['d']}:選ぶ {A['l']}{A['r']}:変える(すぐ保存) ESC:ホーム")
 
     def change_setting(self, step):
         key, _, vals, _ = SETTING_DEFS[self.set_sel]
@@ -1680,8 +1886,12 @@ class App:
         self.last_id = it[0]["id"]
         if it[0]["source"] in ("ocr", "edit") or it[0].get("moved"):
             return
-        self.say(f"受信 {it[0]['name']}" if it[0].get("name")
-                 else f"受信 #{it[0]['id']} ({it[0]['source']})", 3)
+        if self.mode != M_HOME:              # ホームでは新着の数字とゴマエビちゃんで知らせる
+            self.say(f"受信 {it[0]['name']}" if it[0].get("name")
+                     else f"受信 #{it[0]['id']} ({it[0]['source']})", 3)
+        if self.mode != M_HIST:
+            self.unseen += 1
+        self.happy_until = time.time() + 8
         self.next_list = 0.0
         if self.st["auto_show"]:
             self.set_mode(M_HIST)
@@ -1696,7 +1906,12 @@ class App:
         print("ready.", flush=True)
         frames = 0
         while True:
-            if self.mode == M_CLIP:
+            if self.mode == M_HOME:
+                if time.time() > self.next_list:
+                    self.refresh_items()
+                    self.next_list = time.time() + 30
+                img = self.draw_home()
+            elif self.mode == M_CLIP:
                 img = self.draw_clip()
             elif self.mode == M_HIST:
                 if time.time() > self.next_list:   # 変更通知が来た時 (+念のため30秒ごと)
@@ -1717,15 +1932,29 @@ class App:
                     self.refresh_items()
                     break
                 if kind == "ACT" and val == "ESC":
+                    if self.mode != M_HOME:                 # 各画面 → ホームへ
+                        self.home_sel = SCREENS.index(self.mode)
+                        self.set_mode(M_HOME)
+                        break
                     if self.confirm_quit(img):
                         return f"ESC / frames={frames}"
                     break
-                if kind == "ACT" and val == "TAB":
-                    self.set_mode(self.mode + 1)
-                    break
                 if kind == "CHAR" and val in "1234":
-                    self.set_mode(int(val) - 1)
+                    self.open_screen(SCREENS[int(val) - 1])
                     break
+                if kind == "ACT" and val == "TAB" and self.mode != M_HOME:
+                    i = SCREENS.index(self.mode)
+                    self.open_screen(SCREENS[(i + 1) % len(SCREENS)])
+                    break
+                if self.mode == M_HOME:
+                    if kind == "ACT" and val in ("UP", "DOWN", "LEFT", "RIGHT"):
+                        self.home_move(val)
+                    elif kind == "ACT" and val == "ENTER":
+                        self.open_screen(SCREENS[self.home_sel])
+                        break
+                    elif kind == "ACT" and val == "TAB":
+                        self.home_sel = (self.home_sel + 1) % 4
+                    continue
                 if (kind == "CHAR" and val.lower() == "v" and self.mode == M_HIST
                         and self.items):
                     self.make_paste_target(self.items[self.sel])

@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.db
+
+# マスコットのイラストは公開しない (本体にだけ置く)
+assets/mascot/*.png
