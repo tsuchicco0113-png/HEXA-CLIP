@@ -15,6 +15,7 @@ Python 3.8+ の標準ライブラリだけで動く (Windows / Mac / Linux)。
   hexaclip paste --clip [N]    最新をPCのクリップボードへ
   hexaclip get [ID] [-o DIR]   ファイルとして保存 (省略時は最新。名前付きはその名前で)
   hexaclip list [N]            履歴の一覧
+  hexaclip find 語...          履歴を検索 (本文・ファイル名)
   hexaclip info                接続先と状態を表示
 
 環境変数 HEXACLIP_URL / HEXACLIP_TOKEN があれば設定ファイルより優先。
@@ -301,6 +302,19 @@ def cmd_list(cfg, args):
         print(f"#{it['id']:<5} [{it['source']:<4}] {one_line(name + body, 70)}")
 
 
+def cmd_find(cfg, args):
+    if not args:
+        die("検索する語を指定してください (例: hexaclip find main.py)")
+    its = call(cfg, "GET", "/api/items?limit=50&q=" + quote(" ".join(args)))["items"]
+    if not its:
+        info("見つかりません")
+    for it in its:
+        body = f"({human(it.get('size'))})" if it.get("binary") else one_line(it["text"])
+        name = f"{it['name']}: " if it.get("name") else ""
+        star = "★" if it.get("pinned") else " "
+        print(f"{star}#{it['id']:<5} [{it['source']:<4}] {one_line(name + body, 70)}")
+
+
 def cmd_info(cfg):
     r = call(cfg, "GET", "/api/ping", timeout=5)
     print(f"接続先: {cfg['url']}\n本体:   HEXA CLIP {r.get('version', '?')}  (OK)\n"
@@ -318,7 +332,7 @@ def main(argv):
         print(VERSION)
         return
     cmds = {"send": cmd_send, "push": cmd_push, "paste": cmd_paste, "get": cmd_get,
-            "list": cmd_list, "info": lambda cfg, _: cmd_info(cfg)}
+            "list": cmd_list, "find": cmd_find, "info": lambda cfg, _: cmd_info(cfg)}
     if cmd not in cmds:
         die(f"知らないコマンドです: {cmd} (hexaclip help)")
     cfg = load_config()

@@ -5,6 +5,8 @@
   czclip push [TEXT...]   送る(TEXT省略時は標準入力)         例: czclip push < log.txt
   czclip send FILE...     ファイルを名前付きで送る (スマホ/PCの履歴からDLできる)
   czclip list [N]         履歴一覧(既定10件)
+  czclip find 語...       履歴を検索 (本文・ファイル名)
+  czclip star ID          ピン留め★ (履歴が流れても残る)   czclip unstar ID で外す
   czclip get ID           ID指定で出力
   czclip rm ID            削除
   czclip top ID           最新に移す (本体の fn+V で貼り付ける対象になる)
@@ -80,6 +82,22 @@ def main(argv):
             except urllib.error.URLError:
                 sys.exit("czclip: czclipd に接続できません (systemctl status hexaclip を確認)")
             print(f"sent #{j['id']} {j['name']} ({j['size']}B)", file=sys.stderr)
+    elif cmd == "find":
+        if not args:
+            sys.exit("czclip: find には検索語が必要です")
+        from urllib.parse import quote
+        its = call("GET", "/api/items?limit=50&q=" + quote(" ".join(args)))["items"]
+        if not its:
+            print("見つかりません", file=sys.stderr)
+        for it in its:
+            body = f"({it.get('size', 0)}B)" if it.get("binary") else one_line(it["text"])
+            name = f"{it['name']}: " if it.get("name") else ""
+            print(f"{'★' if it.get('pinned') else ' '}#{it['id']:<5} [{it['source']:<4}] {one_line(name + body)}")
+    elif cmd in ("star", "unstar"):
+        if not args or not args[0].isdigit():
+            sys.exit(f"czclip: {cmd} には ID が必要です")
+        call("POST", f"/api/items/{int(args[0])}/pin", {"on": cmd == "star"})
+        print(("★ " if cmd == "star" else "unstarred ") + f"#{args[0]}", file=sys.stderr)
     elif cmd == "list":
         n = int(args[0]) if args else 10
         for it in call("GET", f"/api/items?limit={n}")["items"]:

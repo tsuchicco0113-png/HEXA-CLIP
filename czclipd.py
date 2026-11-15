@@ -26,7 +26,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
-VERSION = "0.6"
+VERSION = "0.7"
 DATA_DIR = os.path.expanduser(os.environ.get("HEXACLIP_DIR", "~/.local/share/hexaclip"))
 DB_PATH = os.path.join(DATA_DIR, "clip.db")
 PIN_PATH = os.path.join(DATA_DIR, "pin")
@@ -65,7 +65,8 @@ class Store:
         if "moved" not in cols:          # 0.5で追加: 「貼付用」で移しただけの項目 (受信通知しない)
             self.db.execute("ALTER TABLE items ADD COLUMN moved INTEGER NOT NULL DEFAULT 0")
         for col, typ in (("name", "TEXT"), ("size", "INTEGER"), ("path", "TEXT"),
-                         ("binary", "INTEGER NOT NULL DEFAULT 0")):   # 0.6で追加: ファイル
+                         ("binary", "INTEGER NOT NULL DEFAULT 0"),    # 0.6で追加: ファイル
+                         ("pinned", "INTEGER NOT NULL DEFAULT 0")):   # 0.7で追加: ピン留め
             if col not in cols:
                 self.db.execute(f"ALTER TABLE items ADD COLUMN {col} {typ}")
         self.db.commit()
@@ -94,30 +95,49 @@ class Store:
                 "INSERT INTO items(text, source, created, name, path, size, binary) "
                 "VALUES(?,?,?,?,?,?,?)",
                 (text, source, time.time(), name, path, size, int(binary)))
-            self.db.execute(
-                "DELETE FROM items WHERE id NOT IN "
+            self.db.execute(                 # 上限を超えたら古い順に消す (ピン留めは残す)
+                "DELETE FROM items WHERE pinned=0 AND id NOT IN "
                 "(SELECT id FROM items ORDER BY id DESC LIMIT ?)", (MAX_ITEMS,))
             self.db.commit()
             self._bump()
             return cur.lastrowid
 
-    COLS = "id, text, source, created, moved, name, size, binary, path"
+    COLS = "id, text, source, created, moved, name, size, binary, path, pinned"
 
     @staticmethod
     def _row(r, preview=0):
         d = dict(id=r[0], text=r[1], source=r[2], created=r[3], moved=bool(r[4]), length=len(r[1]),
                  name=r[5], size=r[6] if r[6] is not None else len(r[1].encode()),
-                 binary=bool(r[7]), path=r[8])
+                 binary=bool(r[7]), path=r[8], pinned=bool(r[9]))
         if preview and len(r[1]) > preview:  # 一覧用: 先頭だけ送る (本体の2秒ごとの取得を軽く)
             d["text"], d["truncated"] = r[1][:preview], True
         return d
 
-    def list(self, limit=50, after=0, preview=0):
+    def list(self, limit=50, after=0, preview=0, q="", pinned=False):
+        """q: 本文かファイル名に含む (大文字小文字・空白区切りは AND) / pinned: ピン留めだけ"""
+        where, args = ["id > ?"], [after]
+        for word in q.split()[:5]:
+            w = "%" + word.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            where.append("(lower(text) LIKE ? ESCAPE '\\' OR lower(ifnull(name,'')) LIKE ? ESCAPE '\\')")
+            args += [w, w]
+        if pinned:
+            where.append("pinned=1")
         with self.lock:
             rows = self.db.execute(
-                f"SELECT {self.COLS} FROM items WHERE id > ? "
-                "ORDER BY id DESC LIMIT ?", (after, limit)).fetchall()
+                f"SELECT {self.COLS} FROM items WHERE {' AND '.join(where)} "
+                "ORDER BY id DESC LIMIT ?", args + [limit]).fetchall()
+            latest = self.db.execute("SELECT max(id) FROM items").fetchone()[0]
+        self.latest = latest or 0
         return [self._row(r, preview) for r in rows]
+
+    def set_pin(self, item_id, on):
+        with self.lock:
+            n = self.db.execute("UPDATE items SET pinned=? WHERE id=?",
+                                (int(bool(on)), item_id)).rowcount
+            self.db.commit()
+            if n:
+                self._bump()
+        return n > 0
 
     def get(self, item_id):
         with self.lock:
@@ -127,14 +147,14 @@ class Store:
     def to_top(self, item_id):
         """指定の項目を最新(一番上)に移す。新しいIDを返す"""
         with self.lock:
-            r = self.db.execute("SELECT text, source, name, path, size, binary FROM items WHERE id=?",
-                                (item_id,)).fetchone()
+            r = self.db.execute("SELECT text, source, name, path, size, binary, pinned FROM items "
+                                "WHERE id=?", (item_id,)).fetchone()
             if not r:
                 return None
             self.db.execute("DELETE FROM items WHERE id=?", (item_id,))
             cur = self.db.execute(
-                "INSERT INTO items(text, source, created, moved, name, path, size, binary) "
-                "VALUES(?,?,?,1,?,?,?,?)", (r[0], r[1], time.time()) + tuple(r[2:]))
+                "INSERT INTO items(text, source, created, moved, name, path, size, binary, pinned) "
+                "VALUES(?,?,?,1,?,?,?,?,?)", (r[0], r[1], time.time()) + tuple(r[2:]))
             self.db.commit()
             self._bump()
             return cur.lastrowid
@@ -344,6 +364,12 @@ display:flex;align-items:center;justify-content:center;font-size:22px;font-weigh
 details.pc{margin:24px 0 0;color:var(--sub);font-size:13px}details.pc summary{cursor:pointer;padding:6px 0}
 details.pc pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre-wrap;
 word-break:break-all;color:var(--fg);font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:6px 0}
+.item{position:relative}.item.pin{border-color:#7a6420}
+.star{position:absolute;top:4px;right:4px;padding:0 8px;border:0;background:transparent;color:#e8c14a;font-size:18px;z-index:1}
+.item .fhead{padding-right:40px}.item pre{padding-right:36px}
+.search input{width:100%;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:10px;
+padding:9px 12px;font:inherit;margin:4px 0 2px}
+.sec{color:var(--sub);font-size:12px;margin:14px 2px 0}
 #toast.on{opacity:1}.err{color:#ff6b6b;min-height:1.5em}.empty{color:var(--sub);text-align:center;padding:30px}
 </style></head><body>
 <div id="login" hidden>
@@ -386,6 +412,8 @@ word-break:break-all;color:var(--fg);font:12px/1.5 ui-monospace,Menlo,Consolas,m
   <div class="row"><button class="grow pri" id="sendBtn" onclick="send()">CPZへ送る</button>
   <button id="reBtn" onclick="reopen()" hidden>範囲を選び直す</button>
   <button onclick="clr()">クリア</button></div>
+  <div class="search"><input id="q" type="search" placeholder="履歴を検索 (ファイル名・本文)" oninput="search()"
+    autocapitalize="off" autocorrect="off" spellcheck="false"></div>
   <div id="list"></div>
   <details class="pc" id="pc" ontoggle="pcInfo()"><summary>PCから使う (hexaclip コマンド)</summary>
     <p>Python 3 があれば Windows / Mac / Linux で使えます。PCのブラウザなら、この画面にファイルを
@@ -406,7 +434,7 @@ python hexaclip.py list</pre>
 <div id="drop" hidden>ドロップして CPZ へ送る</div>
 <div id="toast"></div>
 <script>
-const $=id=>document.getElementById(id);let rev=null,items=[],editing=null,src=null,sel=null,drag=null;
+const $=id=>document.getElementById(id);let rev=null,items=[],pins=[],latest=0,editing=null,src=null,sel=null,drag=null;
 function toast(m,ms){const t=$('toast');t.textContent=m;t.classList.add('on');clearTimeout(t._h);
  t._h=setTimeout(()=>t.classList.remove('on'),ms||1600)}
 async function api(p,o={}){const r=await fetch(p,Object.assign({credentials:'same-origin',
@@ -421,19 +449,28 @@ function fmt(t){const d=new Date(t*1000),o={hour:'2-digit',minute:'2-digit'};
  if(d.toDateString()!==new Date().toDateString()){o.month='numeric';o.day='numeric'}return d.toLocaleString('ja-JP',o)}
 function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function fsize(n){return n<1024?n+'B':n<1048576?(n/1024).toFixed(1)+'KB':(n/1048576).toFixed(1)+'MB'}
-function render(){$('list').innerHTML=items.length?items.map((i,n)=>{const dl=`<a href="/api/files/${i.id}" download>
- <button>DL</button></a>`;return `<div class="item${n?'':' top'}">
+function card(i){const top=i.id===latest&&!i.binary,dl=`<a href="/api/files/${i.id}" download><button>DL</button></a>`;
+ return `<div class="item${top?' top':''}${i.pinned?' pin':''}">
+ <button class="star" onclick="pin(${i.id},${!i.pinned})" title="ピン留め (履歴が流れても残る)">${i.pinned?'★':'☆'}</button>
  ${i.name?`<div class="fhead"><b>${esc(i.name)}</b><span>${fsize(i.size)}</span></div>`:''}
  ${i.binary?`<div class="bin">ファイル (本体の ~/clip/${esc(i.name)})</div>`:`<pre>${esc(i.text)}</pre>`}
  <div class="meta"><span class="src">${esc(i.source)}</span><span>${fmt(i.created)}</span>
- ${n||i.binary?'':'<span class="fnv">fn+V</span>'}<span class="sp"></span>
+ ${top?'<span class="fnv">fn+V</span>':''}<span class="sp"></span>
  <button onclick="del(${i.id})">削除</button>${i.binary?'':`<button onclick="edit(${i.id})">編集</button>`}
- ${n&&!i.binary?`<button onclick="toTop(${i.id})" title="本体の fn+V で貼り付ける対象にする">貼付用</button>`:''}
- ${i.name?dl:''}${i.binary?'':`<button class="pri" onclick="cp(${i.id})">コピー</button>`}</div></div>`}).join('')
- :'<div class="empty">まだ何もありません</div>'}
+ ${!top&&!i.binary?`<button onclick="toTop(${i.id})" title="本体の fn+V で貼り付ける対象にする">貼付用</button>`:''}
+ ${i.name?dl:''}${i.binary?'':`<button class="pri" onclick="cp(${i.id})">コピー</button>`}</div></div>`}
+function render(){const q=$('q').value.trim(),rest=q?items:items.filter(i=>!i.pinned);let h='';
+ if(!q&&pins.length)h+=`<div class="sec">★ ピン留め</div>`+pins.map(card).join('')+`<div class="sec">履歴</div>`;
+ if(q)h+=`<div class="sec">「${esc(q)}」 ${items.length}件</div>`;
+ h+=rest.length?rest.map(card).join(''):`<div class="empty">${q?'見つかりません':'まだ何もありません'}</div>`;
+ $('list').innerHTML=h}
+function find(id){return items.find(i=>i.id===id)||pins.find(i=>i.id===id)}
 function online(ok){$('st').textContent=ok?'● 接続中':'● 切断';$('st').style.color=ok?'var(--acc)':'#ff6b6b'}
-async function load(){try{const r=await api('/api/items?limit=50');items=r.items;rev=r.rev;render();online(true)
- if(editing&&!items.some(i=>i.id===editing)){endEdit(false);toast('編集中の項目が本体で削除されました',2500)}}
+async function load(){try{const q=$('q').value.trim();
+ const [r,p]=await Promise.all([api('/api/items?limit=50'+(q?'&q='+encodeURIComponent(q):'')),
+  q?Promise.resolve({items:pins}):api('/api/items?limit=50&pinned=1')]);
+ items=r.items;pins=p.items;rev=r.rev;latest=r.latest;render();online(true)
+ if(editing&&!find(editing)){endEdit(false);toast('編集中の項目が本体で削除されました',2500)}}
  catch(e){if(e!==401)online(false)}}
 async function poll(){try{const r=await api('/api/ping');online(true);if(r.rev!==rev)await load()}
  catch(e){if(e!==401)online(false)}}
@@ -449,13 +486,16 @@ async function del(id){if(!confirm('#'+id+' を削除しますか?'))return;
  try{await api('/api/items/'+id,{method:'DELETE'})}catch(e){}load()}
 async function toTop(id){try{await api('/api/items/'+id+'/top',{method:'POST',body:'{}'});
  toast('貼付用にしました (本体で fn+V)');load()}catch(e){toast('失敗')}}
-function edit(id){const it=items.find(i=>i.id===id);if(!it||it.binary)return;editing=id;$('t').value=it.text;
+function edit(id){const it=find(id);if(!it||it.binary)return;editing=id;$('t').value=it.text;
  $('fname').value='';$('fname').disabled=true;
  $('t').classList.add('editing');$('editbar').hidden=false;$('edlabel').textContent='#'+id+' を編集中';
  $('sendBtn').textContent='保存';scrollTo({top:0,behavior:'smooth'});$('t').focus()}
 function endEdit(clear){if(clear&&editing)$('t').value='';editing=null;$('fname').disabled=false;$('t').classList.remove('editing');
  $('editbar').hidden=true;$('sendBtn').textContent='CPZへ送る'}
-function cp(id){cpText(items.find(i=>i.id===id).text)}
+function cp(id){cpText(find(id).text)}
+async function pin(id,on){try{await api('/api/items/'+id+'/pin',{method:'POST',body:JSON.stringify({on})});
+ toast(on?'ピン留めしました':'ピン留めを外しました');load()}catch(e){toast('失敗')}}
+let qT=0;function search(){clearTimeout(qT);qT=setTimeout(load,250)}
 function cpText(s){
  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(s).then(()=>toast('コピーしました'))}
  else{const ta=document.createElement('textarea');ta.value=s;ta.style.position='fixed';ta.style.opacity='0';
@@ -695,8 +735,11 @@ class Handler(BaseHTTPRequestHandler):
             limit = max(1, min(int(q.get("limit", ["50"])[0]), MAX_ITEMS))
             after = max(0, int(q.get("after", ["0"])[0]))
             preview = max(0, int(q.get("preview", ["0"])[0]))
-            return self.send_json({"items": self.app.store.list(limit, after, preview),
-                                   "rev": self.app.store.rev})
+            its = self.app.store.list(limit, after, preview, q.get("q", [""])[0],
+                                      q.get("pinned", ["0"])[0] == "1")
+            # latest = fn+V で貼られる項目のID (検索で絞っても分かるように)
+            return self.send_json({"items": its, "rev": self.app.store.rev,
+                                   "latest": self.app.store.latest})
         if u.path == "/api/latest":            # 最新の本文だけ (ショートカットで「CPZからコピー」)
             items = self.app.store.list(1)
             return self.send_text(items[0]["text"] if items else "")
@@ -741,6 +784,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error": "too large"}, 413)
             src = str(data.get("source", "web"))[:16]
             return self.send_json({"id": self.app.store.add(text, src)})
+        if u.path.startswith("/api/items/") and u.path.endswith("/pin"):
+            ok = self.app.store.set_pin(int(u.path.split("/")[3]), data.get("on", True))
+            return self.send_json({"ok": ok}, 200 if ok else 404)
         if u.path.startswith("/api/items/") and u.path.endswith("/top"):
             new = self.app.store.to_top(int(u.path.split("/")[3]))
             return self.send_json({"id": new}) if new else self.send_json({"error": "not found"}, 404)

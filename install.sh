@@ -10,7 +10,7 @@ fi
 APPL=/usr/share/APPLaunch
 
 echo "== packages"
-sudo apt-get install -y python3-pil python3-qrcode tesseract-ocr tesseract-ocr-jpn tesseract-ocr-eng >/dev/null
+sudo apt-get install -y python3-pil python3-qrcode tesseract-ocr tesseract-ocr-jpn tesseract-ocr-eng zbar-tools >/dev/null
 
 echo "== files"
 chmod +x "$DIR/czclip" "$DIR/czclipd.py" "$DIR/czpasted.py" "$DIR/ocr_cam.py" "$DIR/hexaclip-ocr"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v0.8)
+"""HEXA CLIP — CardputerZero 用アプリ (v0.9)
 
 4つのモードを上のタブで切り替える:
   1 クリップ : カメラで文字を読み取り → 修正 → HEXA CLIPへ送る
@@ -37,7 +37,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.8"
+VERSION = "0.9"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -445,6 +445,45 @@ def capture_crop(cam, cw, hires=True, burst=3, settle=0.3):
 OCR_LANGS = {"jpn": "jpn", "jpn+eng": "jpn+eng", "eng": "eng", "code": "eng"}
 
 
+def shutil_which(cmd):
+    import shutil
+    return shutil.which(cmd)
+
+
+def decode_qr_file(path):
+    """zbarimg で読む。中身はバイト列で受け取り UTF-8 → Shift_JIS の順に解釈"""
+    r = subprocess.run(["zbarimg", "--raw", "-q", "-Sbinary", path],
+                       capture_output=True, timeout=20)
+    if r.returncode != 0 or not r.stdout:
+        return ""
+    raw = r.stdout[:-1] if r.stdout.endswith(b"\n") else r.stdout
+    for enc in ("utf-8", "shift_jis"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return raw.decode("utf-8", "replace")
+
+
+def read_qr(cam):
+    """プレビュー画角の全体から QR/バーコードを探す。見つからなければ全画素でもう一度"""
+    tries = [("main", MAIN_W, MAIN_H)]
+    if STILL_CFG is not None:
+        tries.append(("still", FULL_W, FULL_H))
+    for kind, W, H in tries:
+        if kind == "main":
+            y = cam.capture_array("main")
+        else:
+            y = cam.switch_mode_and_capture_array(STILL_CFG, "main")
+        img = Image.fromarray(np.ascontiguousarray(y[:H, :W]))
+        path = "/tmp/ocr_cam_qr.png"
+        img.save(path)
+        text = decode_qr_file(path)
+        if text:
+            return text
+    return ""
+
+
 def run_ocr(img, lang, psm, min_conf=60.0, path="/tmp/ocr_cam_crop.png", timeout=90):
     """文字列だけ返す (信頼度の低い単語は捨てる)"""
     return run_ocr_ex(img, lang, psm, min_conf, keep_low=None, path=path, timeout=timeout)[0]
@@ -535,10 +574,17 @@ def clean(text):
     return text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
 
 
-def clip_items(limit=50, preview=200):
-    """一覧 (本文は先頭 preview 文字だけ。全文は clip_get で)"""
+CLIP_LATEST = [0]          # fn+V で貼られる項目のID (検索中でも分かるように)
+
+
+def clip_items(limit=50, preview=200, q=""):
+    """一覧 (本文は先頭 preview 文字だけ。全文は clip_get で)。q: 検索語"""
+    from urllib.parse import quote
     try:
-        items = clip_call("GET", f"/api/items?limit={limit}&preview={preview}", timeout=1.0)["items"]
+        r = clip_call("GET", f"/api/items?limit={limit}&preview={preview}"
+                      + (f"&q={quote(q)}" if q else ""), timeout=1.5)
+        items = r["items"]
+        CLIP_LATEST[0] = r.get("latest", items[0]["id"] if items else 0)
         for it in items:
             it["text"] = clean(it["text"])
         return items
@@ -576,6 +622,26 @@ def to_top(item_id):
 def fsize(n):
     n = n or 0
     return f"{n}B" if n < 1024 else f"{n / 1024:.1f}KB" if n < 1048576 else f"{n / 1048576:.1f}MB"
+
+
+def demote_kwargs():
+    """sudo で動いているときは、実行するコードを元のユーザーの権限で動かす"""
+    if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
+        uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+        env = dict(os.environ, HOME=HOME, USER=os.environ.get("SUDO_USER", ""))
+        return {"user": uid, "group": gid, "extra_groups": [], "env": env}
+    return {}
+
+
+def stop_proc(proc):
+    """プロセスグループごと止める (子プロセスも)"""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(1.5)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def save_file(text, name):
@@ -814,6 +880,7 @@ class App:
         # 矢印の字形が無いフォントなら英字で代用
         ok = self.font_s.getmask("↑").getbbox() is not None
         self.AR = dict(u="↑", d="↓", l="←", r="→") if ok else dict(u="F", d="X", l="Z", r="C")
+        self.STAR = "★" if self.font_s.getmask("★").getbbox() is not None else "*"
         self.st = load_settings()
         if args.lang:
             self.st["lang"] = args.lang
@@ -822,6 +889,7 @@ class App:
         self.cam_on = True
         self.toast = ("", 0.0)
         self.items, self.sel, self.top = [], 0, 0
+        self.query = ""                     # 履歴の検索語
         self.set_sel = 0
         self.qr_img = None
         it = clip_items(1, 80)
@@ -910,7 +978,7 @@ class App:
     def draw_clip(self):
         img = self.pv.frame(self.cam)
         A = self.AR
-        self.chrome(img, f"ENTER:読取  {A['u']}{A['d']}:ズーム x{self.pv.zoom + 1}")
+        self.chrome(img, f"ENTER:読取 Q:QR {A['u']}{A['d']}:x{self.pv.zoom + 1}")
         d = ImageDraw.Draw(img)
         bx = 226
         d.text((bx - 40, LCD_H - BOT_H + 1), "FOCUS", fill=SUB, font=self.font_s)
@@ -972,7 +1040,7 @@ class App:
     ROWS, ROW_H = 7, 19
 
     def refresh_items(self):
-        items = clip_items(50)
+        items = clip_items(50, q=self.query)
         if items is None:
             self.items = None
             return
@@ -992,6 +1060,9 @@ class App:
         if self.items is None:
             d.text((8, 50), "HEXA CLIP が停止中です", fill=(255, 120, 120), font=self.font)
             d.text((8, 78), "sudo systemctl start hexaclip", fill=SUB, font=self.font_s)
+        elif not self.items and self.query:
+            d.text((8, 50), "見つかりません", fill=SUB, font=self.font)
+            d.text((8, 78), f"「{self.query}」  ESCで検索を解除", fill=SUB, font=self.font_s)
         elif not self.items:
             d.text((8, 50), "まだ何もありません", fill=SUB, font=self.font)
             d.text((8, 78), "スマホから送るか、クリップで読み取り", fill=SUB, font=self.font_s)
@@ -1011,11 +1082,15 @@ class App:
                 if i == self.sel:
                     d.rectangle((0, y, LCD_W - 5, y + self.ROW_H - 1), fill=(34, 48, 58))
                     d.rectangle((0, y, 2, y + self.ROW_H - 1), fill=ACC)
-                d.text((6, y + 3), it["source"][:3], fill=colors.get(it["source"], SUB),
-                       font=self.font_s)
-                if i == 0 and not it.get("binary"):   # fn+V で貼り付けられる項目
+                if it.get("pinned"):            # ピン留めは出どころの代わりに★
+                    d.text((10, y + 2), self.STAR, fill=(232, 193, 74), font=self.font_s)
+                else:
+                    d.text((6, y + 3), it["source"][:3], fill=colors.get(it["source"], SUB),
+                           font=self.font_s)
+                top = it["id"] == CLIP_LATEST[0] and not it.get("binary")
+                if top:                         # fn+V で貼り付けられる項目
                     d.text((LCD_W - 40, y + 3), "fn+V", fill=ACC, font=self.font_s)
-                lim = LCD_W - (84 if i == 0 else 44)
+                lim = LCD_W - (84 if top else 44)
                 x = 34
                 if it.get("name"):              # ファイル: 名前を水色で先に出す
                     nm = self.ellipsize(it["name"], lim * 0.6)
@@ -1031,7 +1106,51 @@ class App:
                 by = TOP_H + 2 + (h - bh) * self.top // max(1, len(self.items) - self.ROWS)
                 d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
         n = len(self.items) if self.items else 0
-        return self.chrome(img, f"{A['u']}{A['d']}:選ぶ ENTER:開く V:貼付用にする  {n}件")
+        if self.query:
+            return self.chrome(img, f"検索「{self.query}」{n}件  /:変更 ESC:解除")
+        return self.chrome(img, f"{A['u']}{A['d']} ENTER:開く V:貼付用 P:★ /:検索 {n}件")
+
+    def toggle_pin(self, item):
+        on = not item.get("pinned")
+        try:
+            clip_call("POST", f"/api/items/{item['id']}/pin", {"on": on})
+            item["pinned"] = on
+            self.say("★ ピン留めしました (履歴が流れても残る)" if on else "ピン留めを外しました")
+        except Exception:
+            self.say("できませんでした")
+        self.next_list = 0.0
+
+    def run_search(self):
+        """検索語の入力 (モーダル)。ENTER で確定、ESC で取りやめ"""
+        q = self.query
+        self.keys.flush(0.15)
+        while True:
+            img = self.draw_hist()
+            d = ImageDraw.Draw(img)
+            d.rectangle((0, 0, LCD_W, TOP_H + 22), fill=(0, 0, 0))
+            d.rectangle((4, 3, LCD_W - 4, TOP_H + 18), outline=ACC, fill=(26, 30, 38))
+            d.text((10, 6), "検索:", fill=SUB, font=self.font_s)
+            x = 44
+            d.text((x, 4), q, fill=FG, font=self.font)
+            cx = x + int(self.font.getlength(q)) + 1
+            d.rectangle((cx, 6, cx + 1, TOP_H + 14), fill=ACC)
+            d.rectangle((0, LCD_H - BOT_H, LCD_W, LCD_H), fill=(0, 0, 0))
+            d.text((4, LCD_H - BOT_H + 1), "英数字で入力  ENTER:検索  ESC:やめる  BS:消す",
+                   fill=(210, 210, 210), font=self.font_s)
+            self.fb.show(img)
+            for kind, val in self.keys.poll(0.5):
+                if kind == "CHAR":
+                    q += val
+                elif val == "BS":
+                    q = q[:-1]
+                elif val == "ENTER":
+                    self.query, self.sel, self.top = q.strip(), 0, 0
+                    self.refresh_items()
+                    self.keys.flush(0.1)
+                    return
+                elif val == "ESC":
+                    self.keys.flush(0.1)
+                    return
 
     def ellipsize(self, text, lim):
         """1行に収まるように省略。先頭だけ見て二分探索 (長いクリップで固まらない)"""
@@ -1073,9 +1192,10 @@ class App:
                 d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
             when = datetime.datetime.fromtimestamp(item["created"]).strftime("%m/%d %H:%M")
             head = item.get("name") or f"#{item['id']}  {item['source']}"
-            title = note or f"{head}  {when}  {len(text)}文字"
+            star = (self.STAR + " ") if item.get("pinned") else ""
+            title = note or f"{star}{head}  {when}  {len(text)}文字"
             hint = ("もう一度 D で削除 / 他のキーで中止" if armed
-                    else f"{A['u']}{A['d']}:送り V:貼付用 E:編集 S:保存 D:削除")
+                    else "V:貼付 E:編集 S:保存 R:実行 Q:QR P:★ D:削除")
             self.fb.show(self.chrome(img, hint, tabs=False, title=title))
             for kind, val in nav(self.keys.poll(0.5)):
                 key = val.lower() if kind == "CHAR" else val
@@ -1114,6 +1234,202 @@ class App:
                         self.say(send_clip(out, "edit"))
                         return
                     self.keys.flush(0.1)
+                elif key == "p":
+                    self.toggle_pin(item)
+                elif key == "q":
+                    self.show_qr(text, f"#{item['id']}")
+                elif key == "r":
+                    self.run_code(item, text)
+
+    # ---- QR: 本体の画面に出してスマホで読む (Wi-Fiなしで渡せる)
+    def show_qr(self, text, label=""):
+        try:
+            import qrcode
+        except ImportError:
+            self.say("QRには sudo apt install python3-qrcode", 4)
+            return
+        data = text.rstrip("\n").encode("utf-8")
+        try:
+            qr = qrcode.QRCode(border=2, box_size=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
+            qr.add_data(data)
+            qr.make(fit=True)
+            m = np.array(qr.get_matrix(), dtype=np.uint8)
+        except Exception:
+            m = None
+        scale = LCD_H // m.shape[0] if m is not None else 0
+        if scale < 2:                        # 1ドット1マスではスマホで読めない
+            self.say(f"長すぎてQRにできません ({len(data)}バイト / 700バイト程度まで)", 4)
+            return
+        q = Image.fromarray((1 - m) * 255).resize((m.shape[1] * scale, m.shape[0] * scale),
+                                                   Image.NEAREST).convert("RGB")
+        img = Image.new("RGB", (LCD_W, LCD_H), (255, 255, 255))
+        img.paste(q, (0, (LCD_H - q.height) // 2))
+        d = ImageDraw.Draw(img)
+        x = q.width + 8
+        d.rectangle((q.width + 2, 0, LCD_W, LCD_H), fill=BG)
+        for i, (t, col) in enumerate([("スマホのカメラで", FG), ("読み取れます", FG), ("", FG),
+                                      (label, SUB), (f"{len(text)}文字", SUB), ("", FG),
+                                      ("Wi-Fi不要", ACC), ("", FG), ("ESC:戻る", SUB)]):
+            d.text((x, 8 + i * 17), t, fill=col, font=self.font_s)
+        self.fb.show(img)
+        self.keys.flush(0.2)
+        while not any(k == "ACT" and v == "ESC" for k, v in self.keys.poll(0.5)):
+            pass
+        self.keys.flush(0.1)
+
+    # ---- QR: 本体のカメラで読む (OCRと違って誤読がない)
+    def do_qr(self):
+        if not shutil_which("zbarimg"):
+            self.say("QR読取には sudo apt install zbar-tools", 4)
+            return
+        self.message("クリップ", "QRを探しています...")
+        try:
+            text = read_qr(self.cam)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.recover_camera()
+            self.say(f"読み取り失敗: {type(e).__name__}", 4)
+            return
+        if not text:
+            self.say("QRが見つかりません (枠に入れて、もう少し離して)", 3)
+            self.keys.flush(0.2)
+            return
+        out = self.run_editor(text, 0.0)
+        if out and out.strip():
+            self.say(send_clip(out, "qr"))
+            it = clip_items(1)
+            if it:
+                self.last_id = max(self.last_id, it[0]["id"])
+        else:
+            self.say("破棄しました")
+
+    # ---- 受け取ったコードを本体で実行
+    RUN_MAX_OUT = 200_000
+
+    @staticmethod
+    def guess_runner(name, text):
+        """python3 か sh か (拡張子 → #! 行 → 中身の雰囲気)"""
+        n = (name or "").lower()
+        if n.endswith(".py"):
+            return "python3"
+        if n.endswith((".sh", ".bash")):
+            return "sh"
+        first = text.lstrip().split("\n", 1)[0]
+        if first.startswith("#!"):
+            return "python3" if "python" in first else "sh"
+        py = ("import ", "from ", "def ", "print(", "class ", "for ", "while ", "if __name__")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        hits = sum(1 for ln in lines if ln.startswith(py) or ln.endswith(":"))
+        return "python3" if lines and hits * 3 >= len(lines) else "sh"
+
+    def run_code(self, item, text):
+        """確認 → 実行 → 出力を表示。ESC で停止。S で出力を HEXA CLIP へ送る"""
+        runner = self.guess_runner(item.get("name"), text)
+        # 1) 確認 (TAB で python3 / sh を切り替え)
+        self.keys.flush(0.15)
+        while True:
+            img = self.canvas()
+            d = ImageDraw.Draw(img)
+            d.text((10, TOP_H + 10), "このコードを本体で実行しますか?", fill=FG, font=self.font)
+            d.text((10, TOP_H + 40), f"実行するもの:  {runner}", fill=ACC, font=self.font)
+            d.text((10, TOP_H + 66), "入力(input)は使えません / ESCで途中で止められます",
+                   fill=SUB, font=self.font_s)
+            d.text((10, TOP_H + 84), "フォルダ: ~/clip/", fill=SUB, font=self.font_s)
+            self.fb.show(self.chrome(img, "ENTER:実行  TAB:python3/sh 切替  ESC:やめる",
+                                     tabs=False, title="実行"))
+            ev = self.keys.poll(0.5)
+            go = None
+            for kind, val in ev:
+                if kind == "ACT" and val == "TAB":
+                    runner = "sh" if runner == "python3" else "python3"
+                elif kind == "ACT" and val == "ENTER":
+                    go = True
+                elif kind == "ACT" and val == "ESC":
+                    go = False
+            if go is False:
+                self.keys.flush(0.1)
+                return
+            if go:
+                break
+        # 2) ファイルにして実行 (名前付きは ~/clip/<名前>、なければ run_<ID>.py/.sh)
+        os.makedirs(CLIP_DIR, exist_ok=True)
+        chown_user(CLIP_DIR)
+        name = item.get("name") or f"run_{item['id']}.{'py' if runner == 'python3' else 'sh'}"
+        path = save_file(text, os.path.basename(name))
+        cmd = ["python3", "-u", path] if runner == "python3" else ["sh", path]
+        out, done = [], {"code": None}
+        t0 = time.time()
+        try:
+            proc = subprocess.Popen(cmd, cwd=CLIP_DIR, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    start_new_session=True, **demote_kwargs())
+        except OSError as e:
+            self.say(f"実行できません: {e.strerror}", 4)
+            return
+
+        def reader():
+            size = 0
+            for raw in iter(lambda: proc.stdout.read1(4096) if hasattr(proc.stdout, "read1")
+                            else proc.stdout.read(4096), b""):
+                if size < self.RUN_MAX_OUT:
+                    out.append(raw.decode("utf-8", "replace"))
+                size += len(raw)
+            code = proc.wait()
+            done["dt"] = time.time() - t0
+            done["code"] = code
+        import threading
+        th = threading.Thread(target=reader, daemon=True)
+        th.start()
+        # 3) 出力を表示 (最後を追いかける。↑↓でスクロールすると追いかけを止める)
+        scroll, follow, note = 0, True, ""
+        rows = (LCD_H - TOP_H - BOT_H - 2) // 15
+        self.keys.flush(0.1)
+        while True:
+            text_out = "".join(out)
+            if len(text_out) >= self.RUN_MAX_OUT:
+                text_out += "\n…(出力が多いため省略)"
+            lines = layout(text_out.replace("\t", "    "), self.font_s, LCD_W - 12)
+            if follow:
+                scroll = max(0, len(lines) - rows)
+            scroll = max(0, min(scroll, max(0, len(lines) - rows)))
+            img = self.canvas()
+            d = ImageDraw.Draw(img)
+            for r in range(rows):
+                if scroll + r >= len(lines):
+                    break
+                a, b = lines[scroll + r]
+                d.text((5, TOP_H + 2 + r * 15), text_out[a:b], fill=FG, font=self.font_s)
+            if not text_out:
+                d.text((5, TOP_H + 4), "(出力なし)", fill=SUB, font=self.font_s)
+            dt = time.time() - t0
+            if done["code"] is None:
+                title = f"実行中 {runner} {os.path.basename(path)}  {dt:.0f}s"
+                hint = "ESC:停止  ↑↓:スクロール"
+            else:
+                ok = done["code"] == 0
+                title = note or (f"終了 OK ({done['dt']:.1f}s)" if ok
+                                 else f"終了 エラー code={done['code']} ({done['dt']:.1f}s)")
+                hint = "S:出力をCLIPへ送る  ESC:閉じる  ↑↓:スクロール"
+            self.fb.show(self.chrome(img, hint.replace("↑↓", self.AR["u"] + self.AR["d"]),
+                                     tabs=False, title=title))
+            for kind, val in nav(self.keys.poll(0.2)):
+                key = val.lower() if kind == "CHAR" else val
+                if key == "ESC":
+                    if done["code"] is None:
+                        stop_proc(proc)
+                        note = "停止しました"
+                        th.join(2)
+                    else:
+                        self.keys.flush(0.1)
+                        return
+                elif key == "UP":
+                    follow, scroll = False, scroll - 1
+                elif key == "DOWN":
+                    scroll += 1
+                    follow = scroll >= len(lines) - rows
+                elif key == "s" and done["code"] is not None:
+                    note = send_clip(text_out or "(出力なし)", "run") if text_out else "出力がありません"
 
     def run_file_detail(self, item):
         """バイナリ (PDF・画像など): 内容は表示せず、場所と大きさだけ"""
@@ -1164,7 +1480,7 @@ class App:
             self.say("ファイルは fn+V できません (~/clip/ にあります)", 3)
             return
         note = paste_note(clip_get(item)["text"])
-        if self.items and item["id"] == self.items[0]["id"]:
+        if item["id"] == CLIP_LATEST[0]:
             self.say(note or "貼付用です  ESCで閉じて fn+V", 4 if note else 3)
             return
         new = to_top(item["id"])
@@ -1320,6 +1636,10 @@ class App:
             frames += 1
 
             for kind, val in nav(self.keys.poll(0.0 if self.mode == M_CLIP else 0.25)):
+                if kind == "ACT" and val == "ESC" and self.mode == M_HIST and self.query:
+                    self.query, self.sel, self.top = "", 0, 0      # まず検索を解除
+                    self.refresh_items()
+                    break
                 if kind == "ACT" and val == "ESC":
                     if self.confirm_quit(img):
                         return f"ESC / frames={frames}"
@@ -1333,6 +1653,15 @@ class App:
                 if (kind == "CHAR" and val.lower() == "v" and self.mode == M_HIST
                         and self.items):
                     self.make_paste_target(self.items[self.sel])
+                    break
+                if kind == "CHAR" and val.lower() == "q" and self.mode == M_CLIP:
+                    self.do_qr()
+                    break
+                if kind == "CHAR" and val == "/" and self.mode == M_HIST and self.items is not None:
+                    self.run_search()
+                    break
+                if kind == "CHAR" and val.lower() == "p" and self.mode == M_HIST and self.items:
+                    self.toggle_pin(self.items[self.sel])
                     break
                 if kind != "ACT":
                     continue
