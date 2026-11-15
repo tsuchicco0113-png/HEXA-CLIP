@@ -50,6 +50,7 @@ class Store:
         self.db.commit()
 
     def add(self, text, source):
+        text = normalize(text)
         with self.lock:
             cur = self.db.execute(
                 "INSERT INTO items(text, source, created) VALUES(?,?,?)",
@@ -99,6 +100,12 @@ class Store:
         with self.lock:
             self.db.execute("DELETE FROM sessions")
             self.db.commit()
+
+
+def normalize(text):
+    """Windows由来の改行(CRLF)やBOMを除き、末尾の改行1つを落とす"""
+    text = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+    return text[:-1] if text.endswith("\n") and not text.endswith("\n\n") else text
 
 
 def load_pin(reset=False):

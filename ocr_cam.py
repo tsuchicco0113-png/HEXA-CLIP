@@ -437,9 +437,16 @@ def clip_call(method, path, body=None, timeout=2.0):
         return json.loads(r.read() or b"{}")
 
 
+def clean(text):
+    return text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def clip_items(limit=50):
     try:
-        return clip_call("GET", f"/api/items?limit={limit}", timeout=1.0)["items"]
+        items = clip_call("GET", f"/api/items?limit={limit}", timeout=1.0)["items"]
+        for it in items:
+            it["text"] = clean(it["text"])
+        return items
     except Exception:
         return None                      # None = サーバー停止中
 

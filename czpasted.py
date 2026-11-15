@@ -156,7 +156,7 @@ def main():
         try:
             with urllib.request.urlopen(a.url + "/api/items?limit=1", timeout=2) as r:
                 items = json.loads(r.read())["items"]
-            return items[0]["text"] if items else ""
+            return items[0]["text"].replace("\ufeff", "") if items else ""
         except Exception as e:
             print("fetch failed:", e, flush=True)
             return ""
