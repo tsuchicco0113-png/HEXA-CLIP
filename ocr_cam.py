@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v0.9)
+"""HEXA CLIP — CardputerZero 用アプリ (v1.0)
 
-4つのモードを上のタブで切り替える:
-  1 クリップ : カメラで文字を読み取り → 修正 → HEXA CLIPへ送る
-  2 履歴     : 受信/送信した内容の一覧・全文表示・編集・保存・削除
-  3 QR       : スマホ接続用のQRコード (読むだけでログイン)
-  4 設定     : OCR言語 / 全画素撮影 / ズーム / 受信時の自動表示
+スマホやPCから送ったコード・資料を受け取って、本体で使う (fn+V で打ち込む / ~/clip/ に置く)。
+
+4つの画面を上のタブで切り替える:
+  1 履歴   : 受け取ったものの一覧 → ENTER で全文 → ENTER でメニュー
+             (貼付用 / 編集 / 保存 / 実行 / QRで表示 / ピン留め / 削除)
+  2 接続   : スマホ接続用のQRコード (読むだけでログイン)
+  3 カメラ : おまけ。本体カメラで文字やQRを読む (カメラは この画面でだけ動く)
+  4 設定   : 受信時の動き / fn+V の改行 / カメラの設定
 
 共通の操作:
   TAB = 次のモード   1〜4 = モードを直接選択   ESC = 戻る (一番上の画面では確認のうえ終了)
@@ -37,7 +40,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.9"
+VERSION = "1.0"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -71,16 +74,15 @@ def chown_user(*paths):
 
 # ---------------------------------------------------------------- settings
 SETTING_DEFS = [
-    ("lang", "OCRの言語", ["jpn", "jpn+eng", "eng", "code"],
-     ["日本語", "日本語+英語", "英語", "コード(空白保持)"]),
-    ("hires", "高精細撮影", [True, False], ["ON (小さい文字向き)", "OFF (速い)"]),
-    ("burst", "連写して選ぶ", [3, 1, 5], ["3枚", "1枚 (速い)", "5枚"]),
-    ("low_conf", "自信のない文字", ["mark", "drop"], ["色付きで残す", "消す"]),
-    ("zoom", "起動時のズーム", [0, 1, 2], ["x1", "x2", "x3"]),
-    ("auto_show", "受信したら表示", [False, True], ["OFF (通知のみ)", "ON (本文を開く)"]),
-    ("paste_erase", "fn+Vで入るVを消す", [True, False], ["ON", "OFF"]),
-    ("paste_newline", "fn+Vの改行", ["enter", "none"], ["ENTERで打つ", "打たない (1行に)"]),
+    ("auto_show", "受信したら", [False, True], ["通知だけ", "本文を開く"]),
+    ("paste_newline", "fn+V の改行", ["enter", "none"], ["ENTERで打つ", "打たない (1行に)"]),
+    ("lang", "カメラ: 言語", ["jpn", "jpn+eng", "eng", "code"],
+     ["日本語", "日本語+英語", "英語", "コード"]),
+    ("hires", "カメラ: 高精細", [True, False], ["ON (小さい文字)", "OFF (速い)"]),
+    ("zoom", "カメラ: ズーム", [0, 1, 2], ["x1", "x2", "x3"]),
 ]
+# 画面からは外した設定 (この値に固定)
+FIXED_SETTINGS = {"burst": 3, "low_conf": "mark", "paste_erase": True}
 
 
 def load_settings():
@@ -91,6 +93,7 @@ def load_settings():
                 st[k] = v
     except (OSError, ValueError):
         pass
+    st.update(FIXED_SETTINGS)
     return st
 
 
@@ -334,9 +337,7 @@ def open_camera():
         lores={"size": (LORES_W, LORES_H), "format": "YUV420"},
         transform=Transform(hflip=1, vflip=1),       # 180°回転
         buffer_count=3))
-    cam.start()
-    time.sleep(0.8)
-    return cam
+    return cam                      # 起動はカメラ画面を開いた時 (set_cam)
 
 
 def sharpness(a):
@@ -867,8 +868,8 @@ class Editor:
 
 
 # ---------------------------------------------------------------- app
-MODES = ["クリップ", "履歴", "QR", "設定"]
-M_CLIP, M_HIST, M_QR, M_SET = range(4)
+MODES = ["履歴", "接続", "カメラ", "設定"]
+M_HIST, M_QR, M_CLIP, M_SET = range(4)
 
 
 class App:
@@ -885,8 +886,8 @@ class App:
         if args.lang:
             self.st["lang"] = args.lang
         self.pv = Preview(self.st["zoom"])
-        self.mode = M_CLIP
-        self.cam_on = True
+        self.mode = M_HIST                  # 最初は履歴 (受け取ったもの)
+        self.cam_on = False                 # カメラは「カメラ」画面でだけ動かす
         self.toast = ("", 0.0)
         self.items, self.sel, self.top = [], 0, 0
         self.query = ""                     # 履歴の検索語
@@ -956,7 +957,7 @@ class App:
 
     # ---- camera on/off (クリップ以外では止めて電池を節約)
     def set_cam(self, on):
-        if on == self.cam_on:
+        if on == self.cam_on or self.cam is None:
             return
         try:
             if on:
@@ -976,9 +977,16 @@ class App:
 
     # ---- 1 クリップ
     def draw_clip(self):
-        img = self.pv.frame(self.cam)
         A = self.AR
-        self.chrome(img, f"ENTER:読取 Q:QR {A['u']}{A['d']}:x{self.pv.zoom + 1}")
+        if self.cam is None:
+            img = self.canvas()
+            d = ImageDraw.Draw(img)
+            d.text((10, 44), "カメラが見つかりません", fill=FG, font=self.font)
+            d.text((10, 74), "文字の読み取りは、スマホ画面の", fill=SUB, font=self.font_s)
+            d.text((10, 92), "「撮って読む」を使ってください", fill=SUB, font=self.font_s)
+            return self.chrome(img, "TAB:次の画面  ESC:終了")
+        img = self.pv.frame(self.cam)
+        self.chrome(img, f"ENTER:文字 Q:QR {A['u']}{A['d']}:x{self.pv.zoom + 1}")
         d = ImageDraw.Draw(img)
         bx = 226
         d.text((bx - 40, LCD_H - BOT_H + 1), "FOCUS", fill=SUB, font=self.font_s)
@@ -1108,7 +1116,7 @@ class App:
         n = len(self.items) if self.items else 0
         if self.query:
             return self.chrome(img, f"検索「{self.query}」{n}件  /:変更 ESC:解除")
-        return self.chrome(img, f"{A['u']}{A['d']} ENTER:開く V:貼付用 P:★ /:検索 {n}件")
+        return self.chrome(img, f"{A['u']}{A['d']}:選ぶ  ENTER:開く  /:検索   {n}件")
 
     def toggle_pin(self, item):
         on = not item.get("pinned")
@@ -1166,6 +1174,50 @@ class App:
                 hi = mid - 1
         return line[:lo] + "…"
 
+    def menu(self, title, options, start=0):
+        """一覧から選ぶ (モーダル)。options=[(表示, 戻り値, 近道キー)]。ESC で None
+        近道キーを直接押しても選べる (覚えたら速い)"""
+        sel, rh = start, 18
+        rows = (LCD_H - TOP_H - BOT_H - 2) // rh
+        A = self.AR
+        self.keys.flush(0.15)
+        while True:
+            img = self.canvas()
+            d = ImageDraw.Draw(img)
+            top = min(max(0, sel - rows + 1), max(0, len(options) - rows))
+            for r in range(min(rows, len(options) - top)):
+                i = top + r
+                label, _, short = options[i]
+                y = TOP_H + 2 + r * rh
+                if i == sel:
+                    d.rectangle((0, y, LCD_W, y + rh - 1), fill=(34, 48, 58))
+                    d.rectangle((0, y, 2, y + rh - 1), fill=ACC)
+                d.text((10, y + 2), label, fill=FG if i == sel else (200, 205, 215), font=self.font_s)
+                if short:
+                    d.text((LCD_W - 22, y + 2), short.upper(), fill=SUB, font=self.font_s)
+            self.fb.show(self.chrome(img, f"{A['u']}{A['d']}:選ぶ  ENTER:決定  ESC:戻る",
+                                     tabs=False, title=title))
+            for kind, val in nav(self.keys.poll(0.5)):
+                if kind == "CHAR":
+                    for _, ret, short in options:
+                        if short and val.lower() == short:
+                            self.keys.flush(0.1)
+                            return ret
+                elif val == "UP":
+                    sel = (sel - 1) % len(options)
+                elif val == "DOWN":
+                    sel = (sel + 1) % len(options)
+                elif val in ("ENTER", "RIGHT"):
+                    self.keys.flush(0.1)
+                    return options[sel][1]
+                elif val in ("ESC", "LEFT"):
+                    self.keys.flush(0.1)
+                    return None
+
+    def confirm(self, title, yes):
+        # カーソルは「やめる」から (ENTER 連打で消えないように)
+        return self.menu(title, [(yes, True, None), ("やめる", False, None)], start=1) is True
+
     def run_detail(self, item):
         """全文表示(モーダル)"""
         item = clip_get(item)
@@ -1195,22 +1247,32 @@ class App:
             star = (self.STAR + " ") if item.get("pinned") else ""
             title = note or f"{star}{head}  {when}  {len(text)}文字"
             hint = ("もう一度 D で削除 / 他のキーで中止" if armed
-                    else "V:貼付 E:編集 S:保存 R:実行 Q:QR P:★ D:削除")
+                    else f"ENTER:メニュー  {A['u']}{A['d']}:送る  ESC:戻る")
             self.fb.show(self.chrome(img, hint, tabs=False, title=title))
             for kind, val in nav(self.keys.poll(0.5)):
                 key = val.lower() if kind == "CHAR" else val
                 if armed:
                     armed = False
                     if key == "d":
-                        try:
-                            clip_call("DELETE", f"/api/items/{item['id']}")
-                            self.say(f"#{item['id']} を削除")
-                        except Exception:
-                            self.say("削除できませんでした")
-                        return
+                        return self.delete_item(item)
                     note = ""
                     continue
                 note = ""
+                if key == "ENTER":
+                    key = self.menu(f"#{item['id']}  " + (item.get("name") or "メニュー"), [
+                        ("貼付用にする (本体で fn+V)", "v", "v"),
+                        ("編集", "e", "e"),
+                        ("ファイルに保存 (~/clip/)", "s", "s"),
+                        ("本体で実行 (python3 / sh)", "r", "r"),
+                        ("QRで表示 (スマホで読む)", "q", "q"),
+                        ("ピン留めを外す" if item.get("pinned") else "ピン留め ★", "p", "p"),
+                        ("削除", "del", "d")])
+                    if key == "del":
+                        if self.confirm(f"#{item['id']} を削除しますか?", "削除する"):
+                            return self.delete_item(item)
+                        continue
+                    if key is None:
+                        continue
                 if key in ("ESC", "LEFT"):
                     return
                 if key == "UP":
@@ -1456,24 +1518,37 @@ class App:
             for txt, col, f in rows:
                 d.text((8, y), self.ellipsize(txt, LCD_W - 16) if txt else "", fill=col, font=f)
                 y += 22 if f is self.font else 18
-            hint = "もう一度 D で履歴から削除 / 他のキーで中止" if armed else "ESC:戻る  D:履歴から削除 (ファイルは残る)"
+            hint = "もう一度 D で履歴から削除 / 他のキーで中止" if armed else "ENTER:メニュー  ESC:戻る"
             self.fb.show(self.chrome(img, hint, tabs=False, title=f"#{item['id']}  ファイル"))
             for kind, val in nav(self.keys.poll(0.5)):
                 key = val.lower() if kind == "CHAR" else val
                 if armed:
                     armed = False
                     if key == "d":
-                        try:
-                            clip_call("DELETE", f"/api/items/{item['id']}")
-                            self.say(f"#{item['id']} を履歴から削除")
-                        except Exception:
-                            self.say("削除できませんでした")
-                        return
+                        return self.delete_item(item)
                     continue
+                if key == "ENTER":
+                    key = self.menu(f"#{item['id']}  {item.get('name') or ''}", [
+                        ("ピン留めを外す" if item.get("pinned") else "ピン留め ★", "p", "p"),
+                        ("履歴から削除 (ファイルは残る)", "del", "d")])
+                    if key == "del":
+                        if self.confirm("履歴から削除しますか?", "削除する"):
+                            return self.delete_item(item)
+                        continue
                 if key in ("ESC", "LEFT"):
                     return
+                if key == "p":
+                    self.toggle_pin(item)
                 if key == "d":
                     armed = True
+
+    def delete_item(self, item):
+        try:
+            clip_call("DELETE", f"/api/items/{item['id']}")
+            self.say(f"#{item['id']} を削除")
+        except Exception:
+            self.say("削除できませんでした")
+        self.next_list = 0.0
 
     def make_paste_target(self, item):
         if item.get("binary"):
@@ -1635,7 +1710,8 @@ class App:
             self.fb.show(img)
             frames += 1
 
-            for kind, val in nav(self.keys.poll(0.0 if self.mode == M_CLIP else 0.25)):
+            live = self.mode == M_CLIP and self.cam is not None
+            for kind, val in nav(self.keys.poll(0.0 if live else 0.25)):
                 if kind == "ACT" and val == "ESC" and self.mode == M_HIST and self.query:
                     self.query, self.sel, self.top = "", 0, 0      # まず検索を解除
                     self.refresh_items()
@@ -1654,7 +1730,7 @@ class App:
                         and self.items):
                     self.make_paste_target(self.items[self.sel])
                     break
-                if kind == "CHAR" and val.lower() == "q" and self.mode == M_CLIP:
+                if kind == "CHAR" and val.lower() == "q" and self.mode == M_CLIP and self.cam:
                     self.do_qr()
                     break
                 if kind == "CHAR" and val == "/" and self.mode == M_HIST and self.items is not None:
@@ -1665,7 +1741,7 @@ class App:
                     break
                 if kind != "ACT":
                     continue
-                if self.mode == M_CLIP:
+                if self.mode == M_CLIP and self.cam is not None:
                     if val == "ENTER":
                         self.do_ocr()
                         break
@@ -1726,7 +1802,11 @@ def main():
 
     fb = FrameBuffer()
     keys = Keys(find_keyboard(), a.debug_keys, cfg)
-    cam = open_camera()
+    try:
+        cam = open_camera()
+    except Exception as e:                  # CardputerZero-Lite などカメラなし
+        print("no camera:", e, flush=True)
+        cam = None
     paused = False
     if not a.no_pause and launcher_pids():
         signal_launcher(signal.SIGSTOP)

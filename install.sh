@@ -13,8 +13,9 @@ echo "== packages"
 sudo apt-get install -y python3-pil python3-qrcode tesseract-ocr tesseract-ocr-jpn tesseract-ocr-eng zbar-tools >/dev/null
 
 echo "== files"
-chmod +x "$DIR/czclip" "$DIR/czclipd.py" "$DIR/czpasted.py" "$DIR/ocr_cam.py" "$DIR/hexaclip-ocr"
-sudo ln -sf "$DIR/czclip" /usr/local/bin/czclip
+chmod +x "$DIR/czclip" "$DIR/czclipd.py" "$DIR/czpasted.py" "$DIR/ocr_cam.py" "$DIR/hexaclip-ocr" "$DIR/pc/hexaclip.py"
+sudo ln -sf "$DIR/pc/hexaclip.py" /usr/local/bin/hexaclip      # PCと同じコマンド
+sudo ln -sf "$DIR/czclip" /usr/local/bin/czclip                # 旧コマンド (互換用)
 sudo ln -sf "$DIR/hexaclip-ocr" /usr/local/bin/hexaclip-ocr
 
 echo "== permissions (画面とキーボードを sudo なしで使う)"
@@ -103,7 +104,7 @@ fi
 
 sleep 1.5
 echo "== done"
-czclip pin
+hexaclip pin
 echo "スマホのブラウザで上のURLを開いて PIN を入力してください"
 if [ "$NEED_REBOOT" = 1 ]; then
   echo ""

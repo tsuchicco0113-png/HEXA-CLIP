@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
-"""hexaclip — PC から HEXA CLIP (CardputerZero) へコードや資料を送る / 受け取る
+"""hexaclip — HEXA CLIP (CardputerZero) にコードや資料を送る / 受け取る
 
-Python 3.8+ の標準ライブラリだけで動く (Windows / Mac / Linux)。
+PC (Windows / Mac / Linux) でも本体でも同じコマンド。Python 3.8+ の標準ライブラリだけで動く。
 
-最初に1回だけ (接続先とトークンを保存。トークンは本体で `czclip token`、
-またはスマホ画面の「PCから使う」に出る):
+PCでは最初に1回だけ (接続先とトークンを保存。トークンはスマホ画面の「PCから使う」か、
+本体で hexaclip token に出る):
   python hexaclip.py setup http://192.168.x.x:8080 TOKEN
+本体では設定不要 (自動で本体のサーバーにつなぐ)。
 
-使い方:
+よく使う:
   hexaclip send FILE...        ファイルを名前付きで送る (本体の ~/clip/ に保存)
   hexaclip push [TEXT...]      テキストを送る (省略時は標準入力)   例: git diff | hexaclip push
   hexaclip push --clip         PCのクリップボードの内容を送る
   hexaclip paste [N]           最新 (またはN番目) を出力           例: hexaclip paste > memo.txt
   hexaclip paste --clip [N]    最新をPCのクリップボードへ
   hexaclip get [ID] [-o DIR]   ファイルとして保存 (省略時は最新。名前付きはその名前で)
-  hexaclip list [N]            履歴の一覧
-  hexaclip find 語...          履歴を検索 (本文・ファイル名)
-  hexaclip info                接続先と状態を表示
+
+履歴:
+  hexaclip list [N]            一覧               hexaclip find 語...   検索
+  hexaclip top ID              fn+V の対象にする  hexaclip rm ID        削除
+  hexaclip star ID / unstar ID ピン留め★ / 外す
+
+本体で使う (接続まわり):
+  hexaclip pin                 スマホ用のURLとPIN    hexaclip qr   同じものをQRで
+  hexaclip token [reset]       PC・ショートカット用のトークン (reset で作り直し)
+  hexaclip logout-all          全端末をログアウト
+  hexaclip info                接続先と状態
 
 環境変数 HEXACLIP_URL / HEXACLIP_TOKEN があれば設定ファイルより優先。
 """
@@ -31,7 +40,8 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote, unquote
 
-VERSION = "0.1"
+VERSION = "0.2"
+LOCAL_URL = "http://127.0.0.1:8080"
 SYSTEM = platform.system()
 
 
@@ -55,10 +65,22 @@ def load_config():
     if os.environ.get("HEXACLIP_TOKEN"):
         cfg["token"] = os.environ["HEXACLIP_TOKEN"]
     if not cfg.get("url") or not cfg.get("token"):
+        if local_server():                   # 本体の上で動いている → 設定なしでOK
+            return {"url": LOCAL_URL, "token": "", "local": True}
         die("接続先が未設定です。最初に:\n  python hexaclip.py setup http://<CPZのIP>:8080 <TOKEN>\n"
-            "(TOKEN は本体で czclip token、またはスマホ画面の「PCから使う」に表示)")
+            "(TOKEN はスマホ画面の「PCから使う」か、本体で hexaclip token に表示)")
     cfg["url"] = cfg["url"].rstrip("/")
+    cfg["local"] = cfg["url"].startswith(("http://127.0.0.1", "http://localhost"))
     return cfg
+
+
+def local_server():
+    """このマシンで HEXA CLIP のサーバーが動いているか (= 本体の上)"""
+    try:
+        with urllib.request.urlopen(LOCAL_URL + "/api/ping", timeout=1.5) as r:
+            return json.loads(r.read()).get("ok") is True
+    except Exception:
+        return False
 
 
 def die(msg, code=1):
@@ -75,7 +97,7 @@ def call(cfg, method, path, body=None, ctype="application/json", raw=False, time
     data = body
     if body is not None and ctype == "application/json":
         data = json.dumps(body).encode()
-    headers = {"Authorization": "Bearer " + cfg["token"]}
+    headers = {"Authorization": "Bearer " + cfg["token"]} if cfg.get("token") else {}
     if data is not None:
         headers["Content-Type"] = ctype
     req = urllib.request.Request(cfg["url"] + path, data=data, method=method, headers=headers)
@@ -90,8 +112,10 @@ def call(cfg, method, path, body=None, ctype="application/json", raw=False, time
             msg = json.loads(e.read()).get("error", "")
         except Exception:
             msg = ""
+        if e.code == 404 and not msg:
+            die("見つかりません (IDは hexaclip list で確認)")
         if e.code == 401:
-            die("トークンが違います (本体で czclip token を確認し、setup し直してください)")
+            die("トークンが違います (本体で hexaclip token を確認し、setup し直してください)")
         die(f"エラー {e.code} {msg}".strip())
     except urllib.error.URLError as e:
         die(f"{cfg['url']} に接続できません ({e.reason})\n"
@@ -220,7 +244,7 @@ def cmd_send(cfg, args):
         with open(path, "rb") as f:
             data = f.read()
         name = os.path.basename(path)
-        r = call(cfg, "POST", f"/api/files?source=pc&name={quote(name)}", data,
+        r = call(cfg, "POST", f"/api/files?source={src(cfg)}&name={quote(name)}", data,
                  ctype="application/octet-stream", timeout=300)
         kind = "ファイル" if r.get("binary") else "テキスト"
         info(f"sent #{r['id']} {r['name']} ({human(r['size'])}, {kind}) → 本体 ~/clip/{r['name']}")
@@ -239,7 +263,7 @@ def cmd_push(cfg, args):
         text = read_stdin()
     if not text.strip():
         die("空なので送りません")
-    r = call(cfg, "POST", "/api/items", {"text": text, "source": "pc"})
+    r = call(cfg, "POST", "/api/items", {"text": text, "source": src(cfg)})
     info(f"pushed #{r['id']} ({len(text)}文字)")
 
 
@@ -315,10 +339,86 @@ def cmd_find(cfg, args):
         print(f"{star}#{it['id']:<5} [{it['source']:<4}] {one_line(name + body, 70)}")
 
 
+def src(cfg):
+    return "cli" if cfg.get("local") else "pc"
+
+
+def need_id(args, cmd):
+    if not args or not args[0].lstrip("#").isdigit():
+        die(f"{cmd} には ID が必要です (IDは hexaclip list で確認)")
+    return int(args[0].lstrip("#"))
+
+
+def cmd_rm(cfg, args):
+    i = need_id(args, "rm")
+    call(cfg, "DELETE", f"/api/items/{i}")
+    info(f"deleted #{i}")
+
+
+def cmd_top(cfg, args):
+    i = need_id(args, "top")
+    r = call(cfg, "POST", f"/api/items/{i}/top", {})
+    info(f"#{i} → #{r.get('id', '?')} (本体の fn+V で貼り付けられます)")
+
+
+def cmd_star(cfg, args, on=True):
+    i = need_id(args, "star" if on else "unstar")
+    call(cfg, "POST", f"/api/items/{i}/pin", {"on": on})
+    info(("★ " if on else "unstarred ") + f"#{i}")
+
+
+def local_only(cfg, path, method="GET", body=None):
+    """本体の上でだけ使える情報 (PIN・トークンの作り直しなど)"""
+    if not cfg.get("local"):
+        die("このコマンドは本体で実行してください (ssh で本体に入って hexaclip ...)")
+    return call(cfg, method, path, body)
+
+
+def cmd_pin(cfg, args):
+    r = local_only(cfg, "/api/pin")
+    print(f"URL: {r['url']}\nPIN: {r['pin']}")
+    if r.get("mdns"):
+        print(f"名前: {r['mdns']}  (IPが変わっても同じ。対応していない端末もあります)")
+    if r.get("online") is False:
+        print("※ Wi-Fi に接続されていません")
+
+
+def cmd_qr(cfg, args):
+    r = local_only(cfg, "/api/pin")
+    try:
+        import qrcode
+        q = qrcode.QRCode(border=2)
+        q.add_data(r["url"] + "#pin=" + r["pin"])
+        q.print_ascii(invert=True)
+    except ImportError:
+        print("(QR表示には sudo apt install python3-qrcode が必要)")
+    print(f"URL: {r['url']}\nPIN: {r['pin']}")
+
+
+def cmd_token(cfg, args):
+    r = (local_only(cfg, "/api/token/reset", "POST", {}) if args[:1] == ["reset"]
+         else local_only(cfg, "/api/token"))
+    p = call(cfg, "GET", "/api/pin")
+    base = (p.get("mdns") or p["url"]).rstrip("/")
+    print(f"TOKEN: {r['token']}\n")
+    print("PCで (最初に1回):")
+    print(f"  python hexaclip.py setup {p['url'].rstrip('/')} {r['token']}\n")
+    print("ショートカット等から送る:")
+    print(f"  POST {base}/api/items   本文=送りたい文字")
+    print(f"  ヘッダ Authorization: Bearer {r['token']} / Content-Type: text/plain")
+    print(f"受け取る: GET {base}/api/latest (同じヘッダ)")
+
+
+def cmd_logout_all(cfg, args):
+    local_only(cfg, "/api/logout_all", "POST", {})
+    info("全端末をログアウトしました")
+
+
 def cmd_info(cfg):
     r = call(cfg, "GET", "/api/ping", timeout=5)
+    where = "本体の上 (設定不要)" if cfg.get("local") else config_path()
     print(f"接続先: {cfg['url']}\n本体:   HEXA CLIP {r.get('version', '?')}  (OK)\n"
-          f"設定:   {config_path()}\nPC:     {SYSTEM} / Python {platform.python_version()}")
+          f"設定:   {where}\nこの機械: {SYSTEM} / Python {platform.python_version()}")
 
 
 def main(argv):
@@ -332,7 +432,10 @@ def main(argv):
         print(VERSION)
         return
     cmds = {"send": cmd_send, "push": cmd_push, "paste": cmd_paste, "get": cmd_get,
-            "list": cmd_list, "find": cmd_find, "info": lambda cfg, _: cmd_info(cfg)}
+            "list": cmd_list, "find": cmd_find, "rm": cmd_rm, "top": cmd_top,
+            "star": cmd_star, "unstar": lambda cfg, a: cmd_star(cfg, a, False),
+            "pin": cmd_pin, "qr": cmd_qr, "token": cmd_token, "logout-all": cmd_logout_all,
+            "info": lambda cfg, _: cmd_info(cfg)}
     if cmd not in cmds:
         die(f"知らないコマンドです: {cmd} (hexaclip help)")
     cfg = load_config()

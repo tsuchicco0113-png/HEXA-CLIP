@@ -353,6 +353,8 @@ background:var(--card);color:var(--fg);border:1px solid var(--line);border-radiu
 padding:8px 16px;border-radius:20px;font-weight:600;opacity:0;transition:.2s;pointer-events:none;z-index:9}
 #unsure{font-size:12px;color:var(--sub);margin:6px 0 0;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 #unsure button{padding:2px 8px;font-size:13px;color:#ffaa3c;border-color:#7a5320;background:#2a2116}
+.tools{display:flex;gap:6px;margin:8px 0 2px}.tools button{padding:6px 9px;font-size:14px}
+.tools .sp{flex:1}button.on{border-color:var(--acc);color:var(--acc)}button.send{padding:12px;font-size:16px}
 .fname{display:flex;gap:8px;margin:8px 0 0}.fname input{flex:1;min-width:0;background:var(--card);color:var(--fg);
 border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:13px ui-monospace,Menlo,Consolas,monospace}
 .fhead{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);
@@ -382,15 +384,17 @@ padding:9px 12px;font:inherit;margin:4px 0 2px}
 <div id="app" hidden>
 <header><b>HEXA CLIP</b><span id="st">●</span></header>
 <main>
-  <div class="row">
-    <button class="cam grow" id="camBtn" onclick="pick()">撮影して文字を読む</button>
-    <select id="lang" aria-label="OCRの言語">
-      <option value="jpn">日本語</option><option value="jpn+eng">日+英</option><option value="eng">英語</option>
-      <option value="code">コード</option>
-    </select>
-  </div>
-  <div class="row" style="margin-top:-6px">
-    <button class="grow" onclick="$('files').click()">ファイルを送る (コード・資料)</button>
+  <div id="editbar" hidden><span id="edlabel"></span><span class="sp"></span>
+    <button onclick="endEdit(true)">編集をやめる</button></div>
+  <textarea id="t" placeholder="コードや文章を貼り付けて「CPZへ送る」&#10;→ 本体の fn+V で打ち込めます"></textarea>
+  <div class="fname" id="fnameBox" hidden><input id="fname" placeholder="ファイル名 (例: main.py → 本体の ~/clip/ に保存)"
+    autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+  <div id="unsure" hidden></div>
+  <div class="tools">
+    <button onclick="pick()" title="スマホで撮って、本体で文字を読む">📷 撮って読む</button>
+    <button onclick="$('files').click()" title="コードや資料をファイルのまま送る">📎 ファイル</button>
+    <button id="nameBtn" onclick="toggleName()" title="名前を付けてファイルとして保存">🏷 名前</button>
+    <span class="sp"></span><button onclick="clr()" title="入力欄をクリア" aria-label="クリア">✕</button>
   </div>
   <input type="file" id="file" accept="image/*" capture="environment" hidden>
   <input type="file" id="files" multiple hidden>
@@ -398,21 +402,18 @@ padding:9px 12px;font:inherit;margin:4px 0 2px}
     <canvas id="cv"></canvas>
     <p class="hint" id="chint">読みたい所を指でなぞって囲むと、速く正確になります</p>
     <div class="row" style="margin-bottom:0">
+      <select id="lang" aria-label="読み取る言語">
+        <option value="jpn">日本語</option><option value="jpn+eng">日+英</option><option value="eng">英語</option>
+        <option value="code">コード</option>
+      </select>
       <button onclick="rot()">回転</button><button onclick="pick()">撮り直し</button>
       <button onclick="closeCrop()">閉じる</button>
-      <button class="pri grow" id="ocrBtn" onclick="doOcr()">読み取る</button>
     </div>
+    <div class="row" style="margin-bottom:0"><button class="pri grow" id="ocrBtn" onclick="doOcr()">読み取る</button></div>
   </div>
-  <div id="editbar" hidden><span id="edlabel"></span><span class="sp"></span>
-    <button onclick="endEdit(true)">編集をやめる</button></div>
-  <textarea id="t" placeholder="ここに貼り付けて「CPZへ送る」→ 本体で fn+V / czclip paste"></textarea>
-  <div class="fname"><input id="fname" placeholder="ファイル名 (任意: main.py → ~/clip/ に保存)"
-    autocapitalize="off" autocorrect="off" spellcheck="false"></div>
-  <div id="unsure" hidden></div>
-  <div class="row"><button class="grow pri" id="sendBtn" onclick="send()">CPZへ送る</button>
-  <button id="reBtn" onclick="reopen()" hidden>範囲を選び直す</button>
-  <button onclick="clr()">クリア</button></div>
-  <div class="search"><input id="q" type="search" placeholder="履歴を検索 (ファイル名・本文)" oninput="search()"
+  <div class="row"><button class="grow pri send" id="sendBtn" onclick="send()">CPZへ送る</button>
+  <button id="reBtn" onclick="reopen()" hidden>範囲を選び直す</button></div>
+  <div class="search"><input id="q" type="search" placeholder="🔍 履歴を検索" oninput="search()"
     autocapitalize="off" autocorrect="off" spellcheck="false"></div>
   <div id="list"></div>
   <details class="pc" id="pc" ontoggle="pcInfo()"><summary>PCから使う (hexaclip コマンド)</summary>
@@ -421,7 +422,7 @@ padding:9px 12px;font:inherit;margin:4px 0 2px}
     <p>1. <a href="/hexaclip.py" style="color:var(--acc)">hexaclip.py をダウンロード</a></p>
     <p>2. 最初に1回だけ (接続先とトークンを保存):</p><pre id="pcsetup">…</pre>
     <button onclick="cpText($('pcsetup').textContent)">コピー</button>
-    <p>3. 使い方:</p><pre># ファイルを送る
+    <p>3. 使い方 (本体でも同じ hexaclip コマンドが使えます):</p><pre># ファイルを送る
 python hexaclip.py send main.py data.pdf
 # PCのクリップボードを送る / 最新をPCのクリップボードへ
 python hexaclip.py push --clip
@@ -478,19 +479,21 @@ async function send(){const v=$('t').value;if(!v.trim())return;const b=$('sendBt
  const nm=$('fname').value.trim();
  try{if(editing){await api('/api/items/'+editing,{method:'PUT',body:JSON.stringify({text:v})});toast('保存しました')}
  else if(nm){const r=await upload(new Blob([v.endsWith('\n')?v:v+'\n'],{type:'text/plain'}),nm);
-  if(!r)return;toast('~/clip/'+r.name+' に保存しました');$('fname').value=''}
+  if(!r)return;toast('~/clip/'+r.name+' に保存しました');toggleName(false)}
  else{await api('/api/items',{method:'POST',body:JSON.stringify({text:v,source:lastOcr?'cam':'web'})});toast('送りました')}
  $('t').value='';lastOcr=false;unsure=[];showUnsure();endEdit(false);load()}catch(e){toast('失敗')}finally{b.disabled=false}}
-function clr(){$('t').value='';lastOcr=false;unsure=[];showUnsure();endEdit(false)}
+function clr(){$('t').value='';lastOcr=false;unsure=[];showUnsure();endEdit(false);toggleName(false)}
+function toggleName(on){const b=$('fnameBox'),open=on===undefined?b.hidden:on;b.hidden=!open;
+ $('nameBtn').classList.toggle('on',open);if(open)$('fname').focus();else $('fname').value=''}
 async function del(id){if(!confirm('#'+id+' を削除しますか?'))return;
  try{await api('/api/items/'+id,{method:'DELETE'})}catch(e){}load()}
 async function toTop(id){try{await api('/api/items/'+id+'/top',{method:'POST',body:'{}'});
  toast('貼付用にしました (本体で fn+V)');load()}catch(e){toast('失敗')}}
 function edit(id){const it=find(id);if(!it||it.binary)return;editing=id;$('t').value=it.text;
- $('fname').value='';$('fname').disabled=true;
+ toggleName(false);$('nameBtn').disabled=true;
  $('t').classList.add('editing');$('editbar').hidden=false;$('edlabel').textContent='#'+id+' を編集中';
  $('sendBtn').textContent='保存';scrollTo({top:0,behavior:'smooth'});$('t').focus()}
-function endEdit(clear){if(clear&&editing)$('t').value='';editing=null;$('fname').disabled=false;$('t').classList.remove('editing');
+function endEdit(clear){if(clear&&editing)$('t').value='';editing=null;$('nameBtn').disabled=false;$('t').classList.remove('editing');
  $('editbar').hidden=true;$('sendBtn').textContent='CPZへ送る'}
 function cp(id){cpText(find(id).text)}
 async function pin(id,on){try{await api('/api/items/'+id+'/pin',{method:'POST',body:JSON.stringify({on})});
