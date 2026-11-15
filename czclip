@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""czclip — HEXA CLIP のコマンド
+
+  czclip paste [N]        最新(またはN番目に新しい)を出力   例: czclip paste > main.py
+  czclip push [TEXT...]   送る(TEXT省略時は標準入力)         例: czclip push < log.txt
+  czclip list [N]         履歴一覧(既定10件)
+  czclip get ID           ID指定で出力
+  czclip rm ID            削除
+  czclip pin              スマホ接続用のURLとPINを表示
+  czclip logout-all       全端末をログアウト(PINは czclipd --reset-pin で変更)
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("HEXACLIP_URL", "http://127.0.0.1:8080")
+
+
+def call(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(BASE + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        sys.exit(f"czclip: error {e.code} {e.read().decode(errors='replace')}")
+    except urllib.error.URLError:
+        sys.exit("czclip: czclipd に接続できません (systemctl status hexaclip を確認)")
+
+
+def one_line(s, n=60):
+    s = s.replace("\n", " ⏎ ")
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, args = argv[0], argv[1:]
+
+    if cmd == "paste":
+        n = int(args[0]) if args else 1
+        items = call("GET", f"/api/items?limit={n}")["items"]
+        if len(items) < n:
+            sys.exit("czclip: 履歴がありません")
+        sys.stdout.write(items[n - 1]["text"])
+        if sys.stdout.isatty() and not items[n - 1]["text"].endswith("\n"):
+            sys.stdout.write("\n")
+    elif cmd == "push":
+        text = " ".join(args) if args else sys.stdin.read()
+        r = call("POST", "/api/items", {"text": text, "source": "cli"})
+        print(f"pushed #{r['id']}", file=sys.stderr)
+    elif cmd == "list":
+        n = int(args[0]) if args else 10
+        for it in call("GET", f"/api/items?limit={n}")["items"]:
+            print(f"#{it['id']:<5} [{it['source']:<4}] {one_line(it['text'])}")
+    elif cmd == "get":
+        sys.stdout.write(call("GET", f"/api/items/{int(args[0])}")["text"])
+    elif cmd == "rm":
+        call("DELETE", f"/api/items/{int(args[0])}")
+        print("deleted", file=sys.stderr)
+    elif cmd == "pin":
+        r = call("GET", "/api/pin")
+        print(f"URL: {r['url']}\nPIN: {r['pin']}")
+    elif cmd == "logout-all":
+        call("POST", "/api/logout_all", {})
+        print("all sessions cleared", file=sys.stderr)
+    else:
+        sys.exit(f"czclip: unknown command '{cmd}' (czclip help)")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
