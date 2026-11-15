@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — OCR camera for CardputerZero (v0.3)
+"""HEXA CLIP — CardputerZero 用アプリ (v0.5)
 
-ﾌﾟﾚﾋﾞｭｰ → ENTERで撮影・OCR → 編集画面で修正 → ENTERでHEXA CLIPへ送る
+4つのモードを上のタブで切り替える:
+  1 クリップ : カメラで文字を読み取り → 修正 → HEXA CLIPへ送る
+  2 履歴     : 受信/送信した内容の一覧・全文表示・編集・保存・削除
+  3 QR       : スマホ接続用のQRコード (読むだけでログイン)
+  4 設定     : OCR言語 / 全画素撮影 / ズーム / 受信時の自動表示
 
-  プレビュー : ENTER=読み取り  Z=ズーム切替(x1/x2)  Q=スマホ接続QR  ESC=終了
-               撮影は全画素(3280x2464)で行う (--no-hires で無効)
-               枠の色/FOCUSバー 緑=ピント良 黄=まあまあ 赤=ボケ
-  編集画面   : ←→↑↓=カーソル  BS=1文字削除  DEL=後ろを削除  TAB=改行
-               英数字・記号=挿入 (日本語の入力は不可)
-               ENTER=送る  ESC=破棄してプレビューへ
+共通の操作:
+  TAB = 次のモード   1〜4 = モードを直接選択   ESC = 戻る (一番上の画面では終了)
+  方向キー = F(↑) X(↓) Z(←) C(→)   ※本体の流儀と同じ。文字入力画面では fn を押しながら
+  画面下に、その画面で使えるキーを常に表示
 
 usage:
-  sudo python3 ocr_cam.py                 # 既定: jpn
-  sudo python3 ocr_cam.py -l jpn+eng
-  sudo python3 ocr_cam.py --debug-keys    # 押したキーのコードを表示
-  sudo python3 ocr_cam.py --keys keys.json  # キー割り当ての上書き(下記)
-  sudo python3 ocr_cam.py --no-pause      # ランチャーを一時停止しない
+  hexaclip-ocr                 # 通常起動 (ホーム画面のアイコンと同じ)
+  hexaclip-ocr --debug-keys    # 押したキーのコードを表示
+  hexaclip-ocr --keys keys.json  # キー割り当ての上書き {"fn":[464],"fn_map":{"33":"UP"}}
+  hexaclip-ocr --no-pause      # ランチャーを一時停止しない
 
 起動中はランチャー(APPLaunch)を一時停止し、自動ロック/スリープと画面の取り合いを防ぐ。
 万一ランチャーが固まったままになったら: sudo pkill -CONT -f APPLaunch
-
-keys.json の例 (fnキー+文字で矢印にしたい場合):
-  {"fn": [464], "fn_map": {"39": "UP", "52": "DOWN", "51": "LEFT", "53": "RIGHT"}}
 """
 import argparse
 import datetime
@@ -39,13 +37,23 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.4"
+VERSION = "0.5"
 LCD_W, LCD_H = 320, 170
+TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
 FULL_W, FULL_H = 3280, 2464          # 撮影用の全画素
 LORES_W, LORES_H = 640, 480          # プレビュー用(同じ画角)
-ZOOMS = [0.6, 0.3]                   # プレビューに映す横幅(全画角に対する割合) x1 / x2
+ZOOMS = [0.6, 0.3, 0.2]              # プレビューに映す横幅(全画角に対する割合) x1 / x2 / x3
 STILL_CFG = None                     # 全画素撮影の設定(open_cameraで作る)
+BOX = (24, 60, 296, 114)             # 読み取り枠(LCD座標)
+
+HOME = os.path.expanduser("~" + os.environ.get("SUDO_USER", ""))
+CLIP_URL = os.environ.get("HEXACLIP_URL", "http://127.0.0.1:8080")
+CLIP_DIR = os.path.join(HOME, "clip")
+SETTINGS_PATH = os.path.join(HOME, ".config", "hexaclip", "settings.json")
+
+BG, FG, SUB, ACC = (14, 16, 22), (235, 238, 245), (150, 158, 175), (47, 214, 123)
+BAR = (0, 90, 60)
 
 
 def view_rect(cw):
@@ -53,10 +61,43 @@ def view_rect(cw):
     ch = cw * (MAIN_W / MAIN_H) / (LCD_W / LCD_H)
     return (1 - cw) / 2, (1 - ch) / 2, cw, ch
 
-BOX = (24, 58, 296, 112)             # 読み取り枠(LCD座標)
 
-CLIP_URL = os.environ.get("HEXACLIP_URL", "http://127.0.0.1:8080")
-CLIP_DIR = os.path.expanduser("~" + os.environ.get("SUDO_USER", "") + "/clip")
+def chown_user(*paths):
+    if os.environ.get("SUDO_UID"):
+        for p in paths:
+            os.chown(p, int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
+
+
+# ---------------------------------------------------------------- settings
+SETTING_DEFS = [
+    ("lang", "OCRの言語", ["jpn", "jpn+eng", "eng"], ["日本語", "日本語+英語", "英語"]),
+    ("hires", "高精細撮影", [True, False], ["ON (小さい文字向き)", "OFF (速い)"]),
+    ("zoom", "起動時のズーム", [0, 1, 2], ["x1", "x2", "x3"]),
+    ("auto_show", "受信したら表示", [False, True], ["OFF (通知のみ)", "ON (本文を開く)"]),
+]
+
+
+def load_settings():
+    st = {k: vals[0] for k, _, vals, _ in SETTING_DEFS}
+    try:
+        for k, v in json.load(open(SETTINGS_PATH)).items():
+            if k in st:
+                st[k] = v
+    except (OSError, ValueError):
+        pass
+    return st
+
+
+def save_settings(st):
+    try:
+        d = os.path.dirname(SETTINGS_PATH)
+        os.makedirs(d, exist_ok=True)
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(st, f)
+        chown_user(d, SETTINGS_PATH)
+    except OSError as e:
+        print("settings save failed:", e)
+
 
 # ---------------------------------------------------------------- keys (Linux input codes)
 EVIOCGRAB = 0x40044590
@@ -78,6 +119,20 @@ CHARS = {
 }
 ACTIONS = {K_UP: "UP", K_DOWN: "DOWN", K_LEFT: "LEFT", K_RIGHT: "RIGHT", K_HOME: "HOME",
            K_END: "END", K_DEL: "DEL", K_BS: "BS", K_TAB: "TAB", K_ENTER: "ENTER", K_ESC: "ESC"}
+KNOWN = set(CHARS) | set(ACTIONS) | {K_LSHIFT, K_RSHIFT, K_CAPS}
+FN_ARROWS = {33: "UP", 45: "DOWN", 44: "LEFT", 46: "RIGHT"}     # fn + F / X / Z / C
+LETTER_NAV = {"f": "UP", "x": "DOWN", "z": "LEFT", "c": "RIGHT"}
+
+
+def nav(events):
+    """文字入力のない画面用: F/X/Z/C 単独を方向キーとして扱う"""
+    out = []
+    for kind, val in events:
+        if kind == "CHAR" and val.lower() in LETTER_NAV:
+            out.append(("ACT", LETTER_NAV[val.lower()]))
+        else:
+            out.append((kind, val))
+    return out
 
 
 class Keys:
@@ -113,7 +168,7 @@ class Keys:
         events = []
         for code, value in self._raw(timeout):
             if self.debug and value == 1:
-                print("key", code)
+                print("key", code, flush=True)
             if value == 0:
                 self.held.discard(code)
                 continue
@@ -127,20 +182,23 @@ class Keys:
                 if value == 1:
                     self.caps = not self.caps
                 continue
-            if code in self.fn_codes:
-                continue
-            fn = any(c in self.held for c in self.fn_codes)
+            if code in self.fn_codes or code not in KNOWN:
+                continue                         # fn / sym など(修飾キーとして held に残す)
+            # fn = 設定で指定したキー、または「知らないキー」が押されている状態
+            fn = any(c in self.fn_codes or c not in KNOWN for c in self.held if c != code)
             if fn and code in self.fn_map:
                 events.append(("ACT", self.fn_map[code]))
+                continue
+            if fn and code in FN_ARROWS:
+                events.append(("ACT", FN_ARROWS[code]))
                 continue
             if code in ACTIONS:
                 events.append(("ACT", ACTIONS[code]))
                 continue
-            if code in CHARS:
-                shift = (K_LSHIFT in self.held or K_RSHIFT in self.held
-                         or self.shift_once) != self.caps
-                events.append(("CHAR", CHARS[code][1 if shift else 0]))
-                self.shift_once = False
+            shift = (K_LSHIFT in self.held or K_RSHIFT in self.held
+                     or self.shift_once) != self.caps
+            events.append(("CHAR", CHARS[code][1 if shift else 0]))
+            self.shift_once = False
         return events
 
     def flush(self, sec=0.6):
@@ -256,19 +314,19 @@ def sharpness(a):
 
 
 class Preview:
-    def __init__(self, font_s):
-        self.font_s = font_s
+    def __init__(self, zoom=0):
         self.peak = 1.0
-        self.toast = ("", 0.0)
-        self.zoom = 0
+        self.zoom = zoom
+        self.ratio = 0.0
 
     @property
     def cw(self):
         return ZOOMS[self.zoom]
 
-    def toggle_zoom(self):
-        self.zoom = (self.zoom + 1) % len(ZOOMS)
-        self.peak = 1.0
+    def set_zoom(self, z):
+        z = max(0, min(len(ZOOMS) - 1, z))
+        if z != self.zoom:
+            self.zoom, self.peak = z, 1.0
 
     def frame(self, cam):
         y = cam.capture_array("lores")[:LORES_H, :LORES_W]
@@ -281,25 +339,14 @@ class Preview:
         sub = view[by0 * vh // LCD_H:by1 * vh // LCD_H, bx0 * vw // LCD_W:bx1 * vw // LCD_W]
         f = sharpness(sub) if sub.size > 16 else 0.0
         self.peak = max(self.peak * 0.995, f, 1.0)
-        ratio = min(f / self.peak, 1.0)
-
+        self.ratio = min(f / self.peak, 1.0)
         img = Image.fromarray(view).resize((LCD_W, LCD_H)).convert("RGB")
-        d = ImageDraw.Draw(img)
-        col = (0, 255, 120) if ratio > 0.8 else (255, 200, 0) if ratio > 0.5 else (255, 80, 80)
-        d.rectangle(BOX, outline=col, width=2)
-        d.rectangle((0, LCD_H - 16, LCD_W, LCD_H), fill=(0, 0, 0))
-        d.text((4, LCD_H - 15), f"ENTER:読取 Z:x{self.zoom + 1} Q:接続", fill=(255, 255, 255),
-               font=self.font_s)
-        bx = 214
-        d.text((bx - 40, LCD_H - 15), "FOCUS", fill=(200, 200, 200), font=self.font_s)
-        d.rectangle((bx, LCD_H - 12, bx + 100, LCD_H - 4), outline=(120, 120, 120))
-        d.rectangle((bx, LCD_H - 12, bx + int(100 * ratio), LCD_H - 4), fill=col)
-        msg, until = self.toast
-        if msg and time.time() < until:
-            w = int(self.font_s.getlength(msg)) + 16
-            d.rounded_rectangle(((LCD_W - w) // 2, 6, (LCD_W + w) // 2, 26), 8, fill=(0, 120, 70))
-            d.text(((LCD_W - w) // 2 + 8, 8), msg, fill=(255, 255, 255), font=self.font_s)
+        ImageDraw.Draw(img).rectangle(BOX, outline=self.color(), width=2)
         return img
+
+    def color(self):
+        r = self.ratio
+        return (0, 255, 120) if r > 0.8 else (255, 200, 0) if r > 0.5 else (255, 80, 80)
 
 
 def box_frac(cw):
@@ -371,77 +418,39 @@ def run_ocr(img, lang, psm, min_conf=60.0):
     return "\n".join(out)
 
 
-# ---------------------------------------------------------------- clip
-def send_clip(text):
+# ---------------------------------------------------------------- clip API
+def clip_call(method, path, body=None, timeout=2.0):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(CLIP_URL + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def clip_items(limit=50):
+    try:
+        return clip_call("GET", f"/api/items?limit={limit}", timeout=1.0)["items"]
+    except Exception:
+        return None                      # None = サーバー停止中
+
+
+def save_file(text, name):
+    os.makedirs(CLIP_DIR, exist_ok=True)
+    p = os.path.join(CLIP_DIR, name)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text if text.endswith("\n") else text + "\n")
+    chown_user(CLIP_DIR, p)
+    return p
+
+
+def send_clip(text, source="ocr"):
     """HEXA CLIPへ送る。失敗したらファイル保存。戻り値: 表示用メッセージ"""
     try:
-        req = urllib.request.Request(
-            CLIP_URL + "/api/items",
-            data=json.dumps({"text": text, "source": "ocr"}).encode(),
-            headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=3) as r:
-            return f"CLIPへ送信 #{json.loads(r.read())['id']}"
+        r = clip_call("POST", "/api/items", {"text": text, "source": source}, 3.0)
+        return f"CLIPへ送信 #{r['id']}"
     except Exception:
-        os.makedirs(CLIP_DIR, exist_ok=True)
-        p = os.path.join(CLIP_DIR, datetime.datetime.now().strftime("ocr_%Y%m%d_%H%M%S.txt"))
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(text + "\n")
-        if os.environ.get("SUDO_UID"):
-            for q in (CLIP_DIR, p):
-                os.chown(q, int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
+        save_file(text, datetime.datetime.now().strftime("ocr_%Y%m%d_%H%M%S.txt"))
         return "CLIP停止中 → ファイル保存"
-
-
-def clip_get(path, timeout=1.0):
-    with urllib.request.urlopen(CLIP_URL + path, timeout=timeout) as r:
-        return json.loads(r.read())
-
-
-def latest_item():
-    try:
-        items = clip_get("/api/items?limit=1", 0.5)["items"]
-        return items[0] if items else None
-    except Exception:
-        return None
-
-
-def connect_screen(font, font_s):
-    """スマホ接続用の画面: QRコード(読むだけでログイン) + URL + PIN"""
-    img = Image.new("RGB", (LCD_W, LCD_H), (14, 16, 22))
-    d = ImageDraw.Draw(img)
-    d.rectangle((0, 0, LCD_W, 17), fill=(0, 90, 60))
-    d.text((4, 1), "スマホ接続  (同じWi-Fiで)", fill=(255, 255, 255), font=font_s)
-    try:
-        info = clip_get("/api/pin")
-    except Exception:
-        d.text((6, 40), "HEXA CLIP が停止中です", fill=(255, 120, 120), font=font)
-        d.text((6, 66), "sudo systemctl start hexaclip", fill=(200, 200, 200), font=font_s)
-        return img
-    url, pin = info["url"], info["pin"]
-    x_text = 6
-    try:
-        import qrcode
-        qr = qrcode.QRCode(border=2, box_size=1,
-                           error_correction=qrcode.constants.ERROR_CORRECT_L)
-        qr.add_data(url + "#pin=" + pin)
-        qr.make(fit=True)
-        m = np.array(qr.get_matrix(), dtype=np.uint8)
-        scale = max(1, 148 // m.shape[0])
-        q = Image.fromarray((1 - m) * 255).resize(
-            (m.shape[1] * scale, m.shape[0] * scale), Image.NEAREST)
-        img.paste(q, (4, 19 + (148 - q.height) // 2))
-        x_text = 4 + q.width + 8
-    except ImportError:
-        d.text((6, 120), "QR: sudo apt install python3-qrcode", fill=(255, 200, 0), font=font_s)
-    host = url.replace("http://", "").rstrip("/")
-    d.text((x_text, 26), "QRを読む か URL:", fill=(150, 158, 175), font=font_s)
-    for i, part in enumerate(host.split(":")):
-        d.text((x_text, 44 + i * 18), part if i == 0 else ":" + part,
-               fill=(235, 238, 245), font=font_s)
-    d.text((x_text, 90), "PIN", fill=(150, 158, 175), font=font_s)
-    d.text((x_text, 104), pin, fill=(47, 214, 123), font=font)
-    d.text((x_text, 148), "何かキーで戻る", fill=(150, 158, 175), font=font_s)
-    return img
 
 
 # ---------------------------------------------------------------- editor
@@ -473,6 +482,7 @@ class Editor:
         self.text, self.cur = text, len(text)
         self.font, self.font_s = font, font_s
         self.elapsed = elapsed
+        self.title = f"編集  OCR {elapsed:.1f}s" if elapsed else "編集"
         self.scroll = 0
         self.width = LCD_W - 10
         self.rows = (LCD_H - self.TOP - self.BOTTOM) // self.LINE_H
@@ -534,7 +544,7 @@ class Editor:
         img = Image.new("RGB", (LCD_W, LCD_H), (14, 16, 22))
         d = ImageDraw.Draw(img)
         d.rectangle((0, 0, LCD_W, 17), fill=(0, 90, 60))
-        d.text((4, 1), f"編集  OCR {self.elapsed:.1f}s  {len(self.text)}文字",
+        d.text((4, 1), f"{self.title}  {len(self.text)}文字",
                fill=(255, 255, 255), font=self.font_s)
         lines = layout(self.text, self.font, self.width)
         n, _ = self._pos(lines)
@@ -560,18 +570,401 @@ class Editor:
             by = self.TOP + (h - bh) * self.scroll // max(1, len(lines) - self.rows)
             d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
         d.rectangle((0, LCD_H - self.BOTTOM, LCD_W, LCD_H), fill=(0, 0, 0))
-        d.text((4, LCD_H - 15), "ENTER:送る  ESC:破棄  TAB:改行  BS:削除",
+        d.text((4, LCD_H - 15), "ENTER:送る ESC:破棄 TAB:改行 fn+FXZC:移動",
                fill=(200, 200, 200), font=self.font_s)
         return img
 
 
-def message(fb, font, title, body):
-    img = Image.new("RGB", (LCD_W, LCD_H), (14, 16, 22))
-    d = ImageDraw.Draw(img)
-    d.rectangle((0, 0, LCD_W, 17), fill=(0, 90, 60))
-    d.text((4, 1), title, fill=(255, 255, 255), font=font)
-    d.text((6, 30), body, fill=(235, 238, 245), font=font)
-    fb.show(img)
+# ---------------------------------------------------------------- app
+MODES = ["クリップ", "履歴", "QR", "設定"]
+M_CLIP, M_HIST, M_QR, M_SET = range(4)
+
+
+class App:
+    def __init__(self, fb, keys, cam, args):
+        self.fb, self.keys, self.cam, self.args = fb, keys, cam, args
+        self.font, font_path = find_font(16)
+        self.font_s, _ = find_font(12)
+        print(f"HEXA CLIP {VERSION}  font: {font_path or '(default)'}", flush=True)
+        # 矢印の字形が無いフォントなら英字で代用
+        ok = self.font_s.getmask("↑").getbbox() is not None
+        self.AR = dict(u="↑", d="↓", l="←", r="→") if ok else dict(u="F", d="X", l="Z", r="C")
+        self.st = load_settings()
+        if args.lang:
+            self.st["lang"] = args.lang
+        self.pv = Preview(self.st["zoom"])
+        self.mode = M_CLIP
+        self.cam_on = True
+        self.toast = ("", 0.0)
+        self.items, self.sel, self.top = [], 0, 0
+        self.set_sel = 0
+        self.qr_img = None
+        it = clip_items(1)
+        self.last_id = it[0]["id"] if it else 0
+        self.next_check = time.time() + 2
+        self.next_list = 0.0
+
+    # ---- drawing
+    def canvas(self):
+        return Image.new("RGB", (LCD_W, LCD_H), BG)
+
+    def chrome(self, img, hint, tabs=True, title=None):
+        d = ImageDraw.Draw(img)
+        d.rectangle((0, 0, LCD_W, TOP_H - 1), fill=(0, 0, 0))
+        if tabs:
+            w = LCD_W // len(MODES)
+            for i, name in enumerate(MODES):
+                on = i == self.mode
+                if on:
+                    d.rectangle((i * w, 0, (i + 1) * w - 1, TOP_H - 1), fill=BAR)
+                label = f"{i + 1} {name}"
+                tw = self.font_s.getlength(label)
+                d.text((i * w + (w - tw) / 2, 1), label, fill=(255, 255, 255) if on else SUB,
+                       font=self.font_s)
+        else:
+            d.rectangle((0, 0, LCD_W, TOP_H - 1), fill=BAR)
+            d.text((4, 1), title or "", fill=(255, 255, 255), font=self.font_s)
+        d.rectangle((0, LCD_H - BOT_H, LCD_W, LCD_H), fill=(0, 0, 0))
+        d.text((4, LCD_H - BOT_H + 1), hint, fill=(210, 210, 210), font=self.font_s)
+        msg, until = self.toast
+        if msg and time.time() < until:
+            w = int(self.font_s.getlength(msg)) + 16
+            d.rounded_rectangle(((LCD_W - w) // 2, TOP_H + 4, (LCD_W + w) // 2, TOP_H + 24), 8,
+                                fill=(0, 120, 70))
+            d.text(((LCD_W - w) // 2 + 8, TOP_H + 6), msg, fill=(255, 255, 255), font=self.font_s)
+        return img
+
+    def say(self, msg, sec=2.5):
+        self.toast = (msg, time.time() + sec)
+
+    def message(self, title, body):
+        img = self.canvas()
+        ImageDraw.Draw(img).text((8, 60), body, fill=FG, font=self.font)
+        self.fb.show(self.chrome(img, "", tabs=False, title=title))
+
+    # ---- camera on/off (クリップ以外では止めて電池を節約)
+    def set_cam(self, on):
+        if on == self.cam_on:
+            return
+        try:
+            if on:
+                self.cam.start()
+                time.sleep(0.4)
+            else:
+                self.cam.stop()
+        except Exception as e:
+            print("camera switch failed:", e)
+        self.cam_on = on
+
+    def set_mode(self, m):
+        self.mode = m % len(MODES)
+        self.set_cam(self.mode == M_CLIP)
+        self.qr_img = None
+        self.next_list = 0.0
+
+    # ---- 1 クリップ
+    def draw_clip(self):
+        img = self.pv.frame(self.cam)
+        A = self.AR
+        self.chrome(img, f"ENTER:読取  {A['u']}{A['d']}:ズーム x{self.pv.zoom + 1}")
+        d = ImageDraw.Draw(img)
+        bx = 226
+        d.text((bx - 40, LCD_H - BOT_H + 1), "FOCUS", fill=SUB, font=self.font_s)
+        d.rectangle((bx, LCD_H - 12, bx + 90, LCD_H - 4), outline=(120, 120, 120))
+        d.rectangle((bx, LCD_H - 12, bx + int(90 * self.pv.ratio), LCD_H - 4), fill=self.pv.color())
+        return img
+
+    def do_ocr(self):
+        self.message("クリップ", "読み取り中...")
+        t0 = time.time()
+        text = run_ocr(capture_crop(self.cam, self.pv.cw, self.st["hires"]),
+                       self.st["lang"], self.args.psm)
+        dt = time.time() - t0
+        print(f"----- OCR ({dt:.1f}s)\n{text}\n-----", flush=True)
+        out = self.run_editor(text, dt)
+        if out and out.strip():
+            self.say(send_clip(out, "ocr"))
+            it = clip_items(1)
+            if it:
+                self.last_id = max(self.last_id, it[0]["id"])
+        else:
+            self.say("破棄しました")
+
+    def run_editor(self, text, elapsed=0.0):
+        """編集画面(モーダル)。送る→文字列 / 破棄→None"""
+        ed = Editor(text, self.font, self.font_s, elapsed)
+        self.keys.flush(0.2)
+        while True:
+            self.fb.show(ed.render())
+            for kind, val in self.keys.poll(0.5):
+                r = ed.handle(kind, val)
+                if r:
+                    self.keys.flush(0.2)
+                    return ed.text if r == "SEND" else None
+
+    # ---- 2 履歴
+    ROWS, ROW_H = 7, 19
+
+    def refresh_items(self):
+        items = clip_items(50)
+        if items is None:
+            self.items = None
+            return
+        cur = self.items[self.sel]["id"] if self.items and self.sel < len(self.items) else None
+        self.items = items
+        if cur is not None:                 # 選択中の項目を追いかける
+            for i, it in enumerate(items):
+                if it["id"] == cur:
+                    self.sel = i
+                    break
+        self.sel = max(0, min(self.sel, len(items) - 1))
+
+    def draw_hist(self):
+        img = self.canvas()
+        d = ImageDraw.Draw(img)
+        A = self.AR
+        if self.items is None:
+            d.text((8, 50), "HEXA CLIP が停止中です", fill=(255, 120, 120), font=self.font)
+            d.text((8, 78), "sudo systemctl start hexaclip", fill=SUB, font=self.font_s)
+        elif not self.items:
+            d.text((8, 50), "まだ何もありません", fill=SUB, font=self.font)
+            d.text((8, 78), "スマホから送るか、クリップで読み取り", fill=SUB, font=self.font_s)
+        else:
+            if self.sel < self.top:
+                self.top = self.sel
+            elif self.sel >= self.top + self.ROWS:
+                self.top = self.sel - self.ROWS + 1
+            colors = {"ocr": (47, 214, 123), "web": (90, 170, 255), "cli": (255, 190, 70)}
+            for r in range(self.ROWS):
+                i = self.top + r
+                if i >= len(self.items):
+                    break
+                it = self.items[i]
+                y = TOP_H + 2 + r * self.ROW_H
+                if i == self.sel:
+                    d.rectangle((0, y, LCD_W - 5, y + self.ROW_H - 1), fill=(34, 48, 58))
+                    d.rectangle((0, y, 2, y + self.ROW_H - 1), fill=ACC)
+                d.text((6, y + 3), it["source"][:3], fill=colors.get(it["source"], SUB),
+                       font=self.font_s)
+                line = " ".join(it["text"].split())
+                while line and self.font_s.getlength(line) > LCD_W - 44:
+                    line = line[:-2] + "…" if not line.endswith("…") else line[:-2] + "…"
+                d.text((34, y + 3), line, fill=FG, font=self.font_s)
+            if len(self.items) > self.ROWS:
+                h = self.ROWS * self.ROW_H
+                bh = max(8, h * self.ROWS // len(self.items))
+                by = TOP_H + 2 + (h - bh) * self.top // max(1, len(self.items) - self.ROWS)
+                d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
+        n = len(self.items) if self.items else 0
+        return self.chrome(img, f"{A['u']}{A['d']}:選ぶ ENTER:開く TAB:次へ ESC:終了  {n}件")
+
+    def run_detail(self, item):
+        """全文表示(モーダル)"""
+        A = self.AR
+        text, scroll, armed, note = item["text"], 0, False, ""
+        rows = (LCD_H - TOP_H - BOT_H - 2) // 20
+        self.keys.flush(0.2)
+        while True:
+            lines = layout(text, self.font, LCD_W - 12)
+            scroll = max(0, min(scroll, max(0, len(lines) - rows)))
+            img = self.canvas()
+            d = ImageDraw.Draw(img)
+            for r in range(rows):
+                if scroll + r >= len(lines):
+                    break
+                s, e = lines[scroll + r]
+                d.text((5, TOP_H + 2 + r * 20), text[s:e], fill=FG, font=self.font)
+            if len(lines) > rows:
+                h = rows * 20
+                bh = max(8, h * rows // len(lines))
+                by = TOP_H + 2 + (h - bh) * scroll // max(1, len(lines) - rows)
+                d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
+            when = datetime.datetime.fromtimestamp(item["created"]).strftime("%m/%d %H:%M")
+            title = note or f"#{item['id']}  {item['source']}  {when}  {len(text)}文字"
+            hint = ("もう一度 D で削除 / 他のキーで中止" if armed
+                    else f"{A['u']}{A['d']}:送り E:編集 S:保存 D:削除 ESC:戻る")
+            self.fb.show(self.chrome(img, hint, tabs=False, title=title))
+            for kind, val in nav(self.keys.poll(0.5)):
+                key = val.lower() if kind == "CHAR" else val
+                if armed:
+                    armed = False
+                    if key == "d":
+                        try:
+                            clip_call("DELETE", f"/api/items/{item['id']}")
+                            self.say(f"#{item['id']} を削除")
+                        except Exception:
+                            self.say("削除できませんでした")
+                        return
+                    note = ""
+                    continue
+                note = ""
+                if key in ("ESC", "LEFT"):
+                    return
+                if key == "UP":
+                    scroll -= 1
+                elif key == "DOWN":
+                    scroll += 1
+                elif key == "d":
+                    armed = True
+                elif key == "s":
+                    p = save_file(text, f"clip_{item['id']}.txt")
+                    note = "保存: ~/clip/" + os.path.basename(p)
+                elif key == "e":
+                    out = self.run_editor(text)
+                    if out and out.strip() and out != text:
+                        self.say(send_clip(out, "edit"))
+                        return
+                    self.keys.flush(0.1)
+
+    # ---- 3 QR
+    def draw_qr(self):
+        if self.qr_img is None:
+            self.qr_img = self.build_qr()
+        return self.chrome(self.qr_img.copy(), "スマホでQRを読む(同じWi-Fi) TAB:次へ ESC:終了")
+
+    def build_qr(self):
+        img = self.canvas()
+        d = ImageDraw.Draw(img)
+        try:
+            info = clip_call("GET", "/api/pin", timeout=1.0)
+        except Exception:
+            d.text((8, 50), "HEXA CLIP が停止中です", fill=(255, 120, 120), font=self.font)
+            d.text((8, 78), "sudo systemctl start hexaclip", fill=SUB, font=self.font_s)
+            return img
+        url, pin = info["url"], info["pin"]
+        x = 8
+        side = LCD_H - TOP_H - BOT_H - 4
+        try:
+            import qrcode
+            qr = qrcode.QRCode(border=2, box_size=1,
+                               error_correction=qrcode.constants.ERROR_CORRECT_L)
+            qr.add_data(url + "#pin=" + pin)
+            qr.make(fit=True)
+            m = np.array(qr.get_matrix(), dtype=np.uint8)
+            scale = max(1, side // m.shape[0])
+            q = Image.fromarray((1 - m) * 255).resize(
+                (m.shape[1] * scale, m.shape[0] * scale), Image.NEAREST)
+            img.paste(q, (4, TOP_H + 2 + (side - q.height) // 2))
+            x = 4 + q.width + 10
+        except ImportError:
+            d.text((8, 118), "QR: sudo apt install python3-qrcode", fill=(255, 200, 0),
+                   font=self.font_s)
+        host = url.replace("http://", "").rstrip("/")
+        d.text((x, TOP_H + 6), "または URL", fill=SUB, font=self.font_s)
+        for i, part in enumerate(host.split(":")):
+            d.text((x, TOP_H + 24 + i * 17), part if i == 0 else ":" + part, fill=FG,
+                   font=self.font_s)
+        d.text((x, TOP_H + 66), "PIN", fill=SUB, font=self.font_s)
+        d.text((x, TOP_H + 82), pin, fill=ACC, font=self.font)
+        return img
+
+    # ---- 4 設定
+    def draw_set(self):
+        img = self.canvas()
+        d = ImageDraw.Draw(img)
+        A = self.AR
+        for i, (key, label, vals, names) in enumerate(SETTING_DEFS):
+            y = TOP_H + 4 + i * 26
+            on = i == self.set_sel
+            if on:
+                d.rectangle((0, y, LCD_W, y + 23), fill=(34, 48, 58))
+                d.rectangle((0, y, 2, y + 23), fill=ACC)
+            d.text((8, y + 5), label, fill=FG, font=self.font_s)
+            try:
+                name = names[vals.index(self.st[key])]
+            except ValueError:
+                name = str(self.st[key])
+            txt = f"{A['l']} {name} {A['r']}" if on else name
+            d.text((LCD_W - 8 - self.font_s.getlength(txt), y + 5), txt,
+                   fill=ACC if on else SUB, font=self.font_s)
+        d.text((8, LCD_H - BOT_H - 16), f"HEXA CLIP v{VERSION}", fill=(90, 98, 115), font=self.font_s)
+        return self.chrome(img, f"{A['u']}{A['d']}:選ぶ {A['l']}{A['r']}:変える(すぐ保存) ESC:終了")
+
+    def change_setting(self, step):
+        key, _, vals, _ = SETTING_DEFS[self.set_sel]
+        try:
+            i = vals.index(self.st[key])
+        except ValueError:
+            i = 0
+        self.st[key] = vals[(i + step) % len(vals)]
+        save_settings(self.st)
+        if key == "zoom":
+            self.pv.set_zoom(self.st["zoom"])
+
+    # ---- 受信の通知
+    def check_incoming(self):
+        if time.time() < self.next_check:
+            return
+        self.next_check = time.time() + 2
+        it = clip_items(1)
+        if not it or it[0]["id"] <= self.last_id:
+            return
+        self.last_id = it[0]["id"]
+        if it[0]["source"] in ("ocr", "edit"):
+            return
+        self.say(f"受信 #{it[0]['id']} ({it[0]['source']})", 3)
+        self.next_list = 0.0
+        if self.st["auto_show"]:
+            self.set_mode(M_HIST)
+            self.refresh_items()
+            self.sel = 0
+            self.run_detail(it[0])
+            self.next_list = 0.0
+
+    # ---- main loop
+    def run(self):
+        self.keys.flush(1.0)
+        print("ready.", flush=True)
+        frames = 0
+        while True:
+            if self.mode == M_CLIP:
+                img = self.draw_clip()
+            elif self.mode == M_HIST:
+                if time.time() > self.next_list:
+                    self.refresh_items()
+                    self.next_list = time.time() + 2
+                img = self.draw_hist()
+            elif self.mode == M_QR:
+                img = self.draw_qr()
+            else:
+                img = self.draw_set()
+            self.fb.show(img)
+            frames += 1
+
+            for kind, val in nav(self.keys.poll(0.0 if self.mode == M_CLIP else 0.25)):
+                if kind == "ACT" and val == "ESC":
+                    return f"ESC / frames={frames}"
+                if kind == "ACT" and val == "TAB":
+                    self.set_mode(self.mode + 1)
+                    break
+                if kind == "CHAR" and val in "1234":
+                    self.set_mode(int(val) - 1)
+                    break
+                if kind != "ACT":
+                    continue
+                if self.mode == M_CLIP:
+                    if val == "ENTER":
+                        self.do_ocr()
+                        break
+                    if val in ("UP", "DOWN"):
+                        self.pv.set_zoom(self.pv.zoom + (1 if val == "UP" else -1))
+                elif self.mode == M_HIST and self.items:
+                    if val == "UP":
+                        self.sel = max(0, self.sel - 1)
+                    elif val == "DOWN":
+                        self.sel = min(len(self.items) - 1, self.sel + 1)
+                    elif val in ("ENTER", "RIGHT"):
+                        self.run_detail(self.items[self.sel])
+                        self.next_list = 0.0
+                        break
+                elif self.mode == M_SET:
+                    if val == "UP":
+                        self.set_sel = max(0, self.set_sel - 1)
+                    elif val == "DOWN":
+                        self.set_sel = min(len(SETTING_DEFS) - 1, self.set_sel + 1)
+                    elif val in ("LEFT", "RIGHT", "ENTER"):
+                        self.change_setting(-1 if val == "LEFT" else 1)
+            self.check_incoming()
 
 
 # ---------------------------------------------------------------- launcher
@@ -600,23 +993,17 @@ def signal_launcher(sig):
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("-l", "--lang", default="jpn")
+    ap.add_argument("-l", "--lang", help="OCR言語を一時的に指定 (設定より優先)")
     ap.add_argument("--psm", type=int, default=6)
     ap.add_argument("--debug-keys", action="store_true")
     ap.add_argument("--keys", help="キー割り当てJSON")
     ap.add_argument("--no-pause", action="store_true", help="ランチャーを一時停止しない")
-    ap.add_argument("--no-hires", action="store_true", help="全画素撮影をしない(速いが粗い)")
     a = ap.parse_args()
-
-    font, font_path = find_font(16)
-    font_s, _ = find_font(12)
-    print(f"HEXA CLIP OCR {VERSION}  font: {font_path or '(default)'}")
     cfg = json.load(open(a.keys)) if a.keys else None
 
     fb = FrameBuffer()
     keys = Keys(find_keyboard(), a.debug_keys, cfg)
     cam = open_camera()
-    pv = Preview(font_s)
     paused = False
     if not a.no_pause and launcher_pids():
         signal_launcher(signal.SIGSTOP)
@@ -624,61 +1011,10 @@ def main():
         # 強制終了(SIGTERM/SIGHUP)でも必ずランチャーを再開する
         for sg in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(sg, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
-        print("launcher paused")
-    keys.flush(1.0)
-    print("ready. ENTER=read / ESC=quit")
-    reason, frames = "unknown", 0
-    it = latest_item()
-    last_id, next_check = (it["id"] if it else 0), time.time() + 2
+        print("launcher paused", flush=True)
+    reason = "unknown"
     try:
-        while True:
-            fb.show(pv.frame(cam))
-            frames += 1
-            ev = keys.poll(0.0)
-            acts = [v for k, v in ev if k == "ACT"]
-            chars = [v.lower() for k, v in ev if k == "CHAR"]
-            if "ESC" in acts:
-                reason = "ESC"
-                break
-            if "z" in chars:
-                pv.toggle_zoom()
-            if "q" in chars:
-                fb.show(connect_screen(font, font_s))
-                keys.flush(0.3)
-                while not keys.poll(0.5):
-                    pass
-                keys.flush(0.2)
-                continue
-            if time.time() > next_check:            # スマホ等からの受信を通知
-                next_check = time.time() + 2
-                it = latest_item()
-                if it and it["id"] > last_id:
-                    last_id = it["id"]
-                    if it["source"] != "ocr":
-                        pv.toast = (f"受信 #{it['id']} ({it['source']})", time.time() + 3)
-            if "ENTER" not in acts:
-                continue
-
-            message(fb, font, "OCR", "読み取り中...")
-            t0 = time.time()
-            text = run_ocr(capture_crop(cam, pv.cw, not a.no_hires), a.lang, a.psm)
-            ed = Editor(text, font, font_s, time.time() - t0)
-            print(f"----- OCR ({ed.elapsed:.1f}s)\n{text}\n-----")
-            keys.flush(0.2)
-            result = None
-            while result is None:
-                fb.show(ed.render())
-                for kind, val in keys.poll(0.5):
-                    result = ed.handle(kind, val)
-                    if result:
-                        break
-            if result == "SEND" and ed.text.strip():
-                msg = send_clip(ed.text)
-                print(f"{msg}\n{ed.text}\n-----")
-            else:
-                msg = "破棄しました"
-            pv.toast = (msg, time.time() + 2.0)
-            keys.flush(0.2)
+        reason = App(fb, keys, cam, a).run()
     except KeyboardInterrupt:
         reason = "Ctrl+C"
     except Exception:
@@ -686,7 +1022,7 @@ def main():
         traceback.print_exc()
         reason = "error"
     finally:
-        print(f"exit: {reason} / frames={frames}")
+        print(f"exit: {reason}", flush=True)
         try:
             cam.stop()
         except Exception:
@@ -695,7 +1031,7 @@ def main():
         fb.clear()
         if paused:
             signal_launcher(signal.SIGCONT)
-            print("launcher resumed")
+            print("launcher resumed", flush=True)
 
 
 if __name__ == "__main__":
