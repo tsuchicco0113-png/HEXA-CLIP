@@ -14,6 +14,10 @@ usage:
   sudo python3 ocr_cam.py -l jpn+eng
   sudo python3 ocr_cam.py --debug-keys    # 押したキーのコードを表示
   sudo python3 ocr_cam.py --keys keys.json  # キー割り当ての上書き(下記)
+  sudo python3 ocr_cam.py --no-pause      # ランチャーを一時停止しない
+
+起動中はランチャー(APPLaunch)を一時停止し、自動ロック/スリープと画面の取り合いを防ぐ。
+万一ランチャーが固まったままになったら: sudo pkill -CONT -f APPLaunch
 
 keys.json の例 (fnキー+文字で矢印にしたい場合):
   {"fn": [464], "fn_map": {"39": "UP", "52": "DOWN", "51": "LEFT", "53": "RIGHT"}}
@@ -25,6 +29,7 @@ import glob
 import json
 import os
 import select
+import signal
 import struct
 import subprocess
 import time
@@ -33,7 +38,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.3"
+VERSION = "0.3.1"
 LCD_W, LCD_H = 320, 170
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
 LORES_W, LORES_H = 400, 300          # プレビュー用(同じ画角)
@@ -200,6 +205,8 @@ def find_font(size):
 
     def rank(f):
         n = os.path.basename(f).lower()
+        if "serif" in n:
+            return 50
         for i, w in enumerate(["medium", "65", "regular", "55", "bold", "75", "black", "light", "thin"]):
             if w in n:
                 return i
@@ -469,6 +476,29 @@ def message(fb, font, title, body):
     fb.show(img)
 
 
+# ---------------------------------------------------------------- launcher
+def launcher_pids():
+    pids = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            cmd = open(f"/proc/{d}/cmdline", "rb").read()
+        except OSError:
+            continue
+        if b"M5CardputerZero-APPLaunch" in cmd:
+            pids.append(int(d))
+    return pids
+
+
+def signal_launcher(sig):
+    for pid in launcher_pids():
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -476,6 +506,7 @@ def main():
     ap.add_argument("--psm", type=int, default=6)
     ap.add_argument("--debug-keys", action="store_true")
     ap.add_argument("--keys", help="キー割り当てJSON")
+    ap.add_argument("--no-pause", action="store_true", help="ランチャーを一時停止しない")
     a = ap.parse_args()
 
     font, font_path = find_font(16)
@@ -487,6 +518,14 @@ def main():
     keys = Keys(find_keyboard(), a.debug_keys, cfg)
     cam = open_camera()
     pv = Preview(font_s)
+    paused = False
+    if not a.no_pause and launcher_pids():
+        signal_launcher(signal.SIGSTOP)
+        paused = True
+        # 強制終了(SIGTERM/SIGHUP)でも必ずランチャーを再開する
+        for sg in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sg, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+        print("launcher paused")
     keys.flush(1.0)
     print("ready. ENTER=read / ESC=quit")
     reason, frames = "unknown", 0
@@ -535,6 +574,9 @@ def main():
             pass
         keys.close()
         fb.clear()
+        if paused:
+            signal_launcher(signal.SIGCONT)
+            print("launcher resumed")
 
 
 if __name__ == "__main__":

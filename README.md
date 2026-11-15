@@ -57,6 +57,8 @@ sudo python3 ~/hexaclip/ocr_cam.py -l jpn+eng
 - カメラ (IMX219) は固定焦点。30〜40cm 程度離して撮るとピントが合います
 - 本体に日本語IMEは無いため、日本語の修正は削除のみ (挿入は英数字・記号)
 - キー割り当ての確認: `--debug-keys`、上書き: `--keys keys.json`
+- 起動中はランチャー(APPLaunch)を一時停止し、自動ロック/スリープと画面の取り合いを防ぎます (`--no-pause` で無効)。
+  万一ランチャーが固まったままになったら `sudo pkill -CONT -f APPLaunch`
 
 ## セキュリティ
 
