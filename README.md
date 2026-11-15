@@ -7,6 +7,8 @@ M5Stack **CardputerZero** 用の共有クリップボード + カメラOCR。
 - 本体カメラで文字を読み取り (Tesseract)、本体キーボードで修正してクリップへ送る
 - **スマホで撮影 → 本体で読み取り → スマホで直して送る** (本体カメラより高画素・AF付きで小さい文字に強い)
 - 履歴をスマホで編集 (本体に日本語IMEが無くても日本語を直せる)
+- **ファイルを名前付きで送る** (コード・PDF・画像など) → 本体の `~/clip/` に保存。本体→スマホ/PCへも
+- **PC用コマンド `hexaclip`** (Windows / Mac / Linux): ファイル送信、PCのクリップボードとの受け渡し
 
 ```
  入力                     中核                        出力
@@ -21,7 +23,8 @@ M5Stack **CardputerZero** 用の共有クリップボード + カメラOCR。
 | ファイル | 役割 |
 |---|---|
 | `czclipd.py` | 常駐サーバー。SQLite に履歴保存、`:8080` でスマホ用Web画面 (PIN認証)。標準ライブラリのみ |
-| `czclip` | CLI (`paste` / `push` / `list` / `get` / `rm` / `top` / `pin` / `qr` / `token` / `logout-all`) |
+| `czclip` | CLI (`paste` / `push` / `send` / `list` / `get` / `rm` / `top` / `pin` / `qr` / `token` / `logout-all`) |
+| `pc/hexaclip.py` | PC用コマンド (標準ライブラリのみ)。本体の `http://<CPZ>:8080/hexaclip.py` からもダウンロードできる |
 | `ocr_cam.py` | 本体アプリ (クリップ / 履歴 / QR / 設定) |
 | `czpasted.py` | fn+V で最新のクリップをキー入力として貼り付ける常駐プログラム |
 | `hexaclip-ocr` | OCRアプリの起動スクリプト (ランチャーから起動時は `~/.local/share/hexaclip/ocr.log` にログ) |
@@ -44,6 +47,7 @@ cd ~/hexaclip && sh install.sh      # sudo は付けない
 czclip paste > main.py     # スマホから送ったコードを保存
 czclip paste | python3     # そのまま実行
 czclip push < log.txt      # スマホへ送る
+czclip send log.txt        # ファイルとして送る (スマホ/PCの履歴からDL)
 czclip list                # 履歴
 czclip paste 3             # 3番目に新しいもの
 czclip top 12              # #12 を最新に移す (fn+V の対象にする)
@@ -113,6 +117,41 @@ hexaclip-ocr               # ホーム画面のアイコンと同じ
 - 打ち込み中に `ESC` で中止。最大4000文字
 - 本体は fn+V で `V` が入力されるため、貼り付け前に1文字消します (設定「fn+Vで入るVを消す」で OFF にできます)
 - 止める: `sudo systemctl disable --now hexaclip-paste`
+
+### ファイルを送る
+
+- スマホ: `ファイルを送る` で選ぶ (複数可)。PCのブラウザなら画面にドラッグ&ドロップ
+- 貼り付けた文字に `ファイル名` を付けて送ると、その名前で保存
+- 本体の `~/clip/<名前>` に保存。同じ名前があれば1つ前を `~/clip/.prev/` に残します
+- UTF-8のテキスト (256KB以下) は履歴に本文も入り、本体で表示・編集・fn+V できます。
+  Windowsの改行 (CRLF) とBOMは自動で直します
+- PDF・画像などは履歴の `DL` でダウンロード (本体ではファイルの場所を表示)。上限100MB
+- 履歴を削除しても `~/clip/` のファイルは残ります
+
+### PCから使う (hexaclip コマンド)
+
+Python 3 があれば Windows / Mac / Linux で使えます。スマホ画面の一番下「PCから使う」に、
+ダウンロードリンクと設定コマンド (トークン入り) が出ます。
+
+```bash
+# 本体から取ってくる
+curl -O http://<CPZ>:8080/hexaclip.py
+# 最初に1回だけ (トークンは czclip token か、スマホ画面の「PCから使う」)
+python hexaclip.py setup http://<CPZ>:8080 <TOKEN>
+
+python hexaclip.py send main.py 資料.pdf   # ファイルを送る
+git diff | python hexaclip.py push         # 標準入力を送る
+python hexaclip.py push --clip             # PCのクリップボードを送る
+python hexaclip.py paste --clip            # 最新をPCのクリップボードへ
+python hexaclip.py paste > memo.txt        # 最新をファイルへ (UTF-8)
+python hexaclip.py get                     # 最新のファイルを保存 (同名は (1) を付けて上書きしない)
+python hexaclip.py get 12 -o downloads     # ID指定
+python hexaclip.py list
+```
+
+- Windows のクリップボードは PowerShell 経由 (日本語も文字化けしない)。Mac は pbcopy/pbpaste、
+  Linux は wl-clipboard か xclip
+- 設定の保存先: Windows `%APPDATA%\hexaclip\config.json` / その他 `~/.config/hexaclip/pc.json`
 
 ### 共有シート / ショートカットから送る
 

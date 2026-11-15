@@ -12,6 +12,7 @@
 import argparse
 import hmac
 import json
+import mimetypes
 import os
 import secrets
 import socket
@@ -23,13 +24,16 @@ import threading
 import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
-VERSION = "0.5"
+VERSION = "0.6"
 DATA_DIR = os.path.expanduser(os.environ.get("HEXACLIP_DIR", "~/.local/share/hexaclip"))
 DB_PATH = os.path.join(DATA_DIR, "clip.db")
 PIN_PATH = os.path.join(DATA_DIR, "pin")
 TOKEN_PATH = os.path.join(DATA_DIR, "api_token")
+FILES_DIR = os.path.expanduser(os.environ.get("HEXACLIP_FILES", "~/clip"))   # 受け取ったファイルの置き場
+MAX_FILE = 100 * 1024 * 1024   # ファイル1つの上限 100MB
+PC_TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pc", "hexaclip.py")
 MAX_SSE = 8                    # 同時にリアルタイム接続できる数
 MAX_TEXT = 256 * 1024          # 1件の上限 256KB
 MAX_ITEMS = 500                # 履歴の上限
@@ -60,6 +64,10 @@ class Store:
         cols = [r[1] for r in self.db.execute("PRAGMA table_info(items)")]
         if "moved" not in cols:          # 0.5で追加: 「貼付用」で移しただけの項目 (受信通知しない)
             self.db.execute("ALTER TABLE items ADD COLUMN moved INTEGER NOT NULL DEFAULT 0")
+        for col, typ in (("name", "TEXT"), ("size", "INTEGER"), ("path", "TEXT"),
+                         ("binary", "INTEGER NOT NULL DEFAULT 0")):   # 0.6で追加: ファイル
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE items ADD COLUMN {col} {typ}")
         self.db.commit()
         # 追加/削除/並び替え/編集のたびに増える番号。画面はこれが変わったら一覧を取り直す
         self.rev = int(time.time() * 1000)
@@ -76,12 +84,16 @@ class Store:
             self.changed.wait_for(lambda: self.rev != rev, timeout)
             return self.rev
 
-    def add(self, text, source):
-        text = normalize(text)
+    def add(self, text, source, name=None, path=None, size=None, binary=False, trim=True):
+        """trim=False: ファイルの中身はそのまま (末尾の改行を落とさない)"""
+        text = normalize(text) if trim else text
+        if size is None:
+            size = len(text.encode())
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO items(text, source, created) VALUES(?,?,?)",
-                (text, source, time.time()))
+                "INSERT INTO items(text, source, created, name, path, size, binary) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (text, source, time.time(), name, path, size, int(binary)))
             self.db.execute(
                 "DELETE FROM items WHERE id NOT IN "
                 "(SELECT id FROM items ORDER BY id DESC LIMIT ?)", (MAX_ITEMS,))
@@ -89,11 +101,13 @@ class Store:
             self._bump()
             return cur.lastrowid
 
-    COLS = "id, text, source, created, moved"
+    COLS = "id, text, source, created, moved, name, size, binary, path"
 
     @staticmethod
     def _row(r, preview=0):
-        d = dict(id=r[0], text=r[1], source=r[2], created=r[3], moved=bool(r[4]), length=len(r[1]))
+        d = dict(id=r[0], text=r[1], source=r[2], created=r[3], moved=bool(r[4]), length=len(r[1]),
+                 name=r[5], size=r[6] if r[6] is not None else len(r[1].encode()),
+                 binary=bool(r[7]), path=r[8])
         if preview and len(r[1]) > preview:  # 一覧用: 先頭だけ送る (本体の2秒ごとの取得を軽く)
             d["text"], d["truncated"] = r[1][:preview], True
         return d
@@ -113,22 +127,34 @@ class Store:
     def to_top(self, item_id):
         """指定の項目を最新(一番上)に移す。新しいIDを返す"""
         with self.lock:
-            r = self.db.execute("SELECT text, source FROM items WHERE id=?", (item_id,)).fetchone()
+            r = self.db.execute("SELECT text, source, name, path, size, binary FROM items WHERE id=?",
+                                (item_id,)).fetchone()
             if not r:
                 return None
             self.db.execute("DELETE FROM items WHERE id=?", (item_id,))
-            cur = self.db.execute("INSERT INTO items(text, source, created, moved) VALUES(?,?,?,1)",
-                                  (r[0], r[1], time.time()))
+            cur = self.db.execute(
+                "INSERT INTO items(text, source, created, moved, name, path, size, binary) "
+                "VALUES(?,?,?,1,?,?,?,?)", (r[0], r[1], time.time()) + tuple(r[2:]))
             self.db.commit()
             self._bump()
             return cur.lastrowid
 
     def update(self, item_id, text):
-        """本文を書き換える (スマホでの編集)。位置(ID)は変えない"""
-        text = normalize(text)
+        """本文を書き換える (スマホでの編集)。位置(ID)は変えない。
+        名前付きのファイルなら ~/clip/ のファイルも書き換える。バイナリは編集不可"""
         with self.lock:
-            n = self.db.execute("UPDATE items SET text=?, created=? WHERE id=?",
-                                (text, time.time(), item_id)).rowcount
+            r = self.db.execute("SELECT name, path, binary FROM items WHERE id=?",
+                                (item_id,)).fetchone()
+            if not r or r[2]:
+                return False
+            if r[0]:                         # ファイル: 改行コードだけそろえ、末尾の改行は保つ
+                text = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+                if r[1]:
+                    write_text_file(r[1], text)
+            else:
+                text = normalize(text)
+            n = self.db.execute("UPDATE items SET text=?, created=?, size=? WHERE id=?",
+                                (text, time.time(), len(text.encode()), item_id)).rowcount
             self.db.commit()
             if n:
                 self._bump()
@@ -168,6 +194,31 @@ def normalize(text):
     """Windows由来の改行(CRLF)やBOMを除き、末尾の改行1つを落とす"""
     text = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
     return text[:-1] if text.endswith("\n") and not text.endswith("\n\n") else text
+
+
+def safe_name(name):
+    """ファイル名だけにする (フォルダ指定や危ない文字を除く)。だめなら None"""
+    name = str(name or "").replace("\\", "/").split("/")[-1]
+    name = "".join(c for c in name if c.isprintable() and c not in '<>:"|?*').strip()
+    name = name.lstrip(".").strip()
+    return name[:120] or None
+
+
+def write_text_file(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def place_file(tmp, name):
+    """一時ファイルを ~/clip/<name> へ。同名があれば ~/clip/.prev/ に1つ前を残す"""
+    final = os.path.join(FILES_DIR, name)
+    if os.path.exists(final):
+        prev = os.path.join(FILES_DIR, ".prev")
+        os.makedirs(prev, exist_ok=True)
+        os.replace(final, os.path.join(prev, name))
+    os.replace(tmp, final)
+    return final
 
 
 def load_pin(reset=False):
@@ -282,6 +333,17 @@ background:var(--card);color:var(--fg);border:1px solid var(--line);border-radiu
 padding:8px 16px;border-radius:20px;font-weight:600;opacity:0;transition:.2s;pointer-events:none;z-index:9}
 #unsure{font-size:12px;color:var(--sub);margin:6px 0 0;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 #unsure button{padding:2px 8px;font-size:13px;color:#ffaa3c;border-color:#7a5320;background:#2a2116}
+.fname{display:flex;gap:8px;margin:8px 0 0}.fname input{flex:1;min-width:0;background:var(--card);color:var(--fg);
+border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:13px ui-monospace,Menlo,Consolas,monospace}
+.fhead{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);
+font:13px ui-monospace,Menlo,Consolas,monospace;color:#9fd0ff}.fhead b{flex:1;word-break:break-all;font-weight:600}
+.fhead span{color:var(--sub);font-size:12px;white-space:nowrap}
+.bin{padding:12px;color:var(--sub);font-size:13px}
+#drop{position:fixed;inset:0;background:rgba(47,214,123,.12);border:3px dashed var(--acc);z-index:8;
+display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700;color:var(--acc);pointer-events:none}
+details.pc{margin:24px 0 0;color:var(--sub);font-size:13px}details.pc summary{cursor:pointer;padding:6px 0}
+details.pc pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre-wrap;
+word-break:break-all;color:var(--fg);font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:6px 0}
 #toast.on{opacity:1}.err{color:#ff6b6b;min-height:1.5em}.empty{color:var(--sub);text-align:center;padding:30px}
 </style></head><body>
 <div id="login" hidden>
@@ -301,7 +363,11 @@ padding:8px 16px;border-radius:20px;font-weight:600;opacity:0;transition:.2s;poi
       <option value="code">コード</option>
     </select>
   </div>
+  <div class="row" style="margin-top:-6px">
+    <button class="grow" onclick="$('files').click()">ファイルを送る (コード・資料)</button>
+  </div>
   <input type="file" id="file" accept="image/*" capture="environment" hidden>
+  <input type="file" id="files" multiple hidden>
   <div id="crop" class="panel" hidden>
     <canvas id="cv"></canvas>
     <p class="hint" id="chint">読みたい所を指でなぞって囲むと、速く正確になります</p>
@@ -314,12 +380,30 @@ padding:8px 16px;border-radius:20px;font-weight:600;opacity:0;transition:.2s;poi
   <div id="editbar" hidden><span id="edlabel"></span><span class="sp"></span>
     <button onclick="endEdit(true)">編集をやめる</button></div>
   <textarea id="t" placeholder="ここに貼り付けて「CPZへ送る」→ 本体で fn+V / czclip paste"></textarea>
+  <div class="fname"><input id="fname" placeholder="ファイル名 (任意: main.py → ~/clip/ に保存)"
+    autocapitalize="off" autocorrect="off" spellcheck="false"></div>
   <div id="unsure" hidden></div>
   <div class="row"><button class="grow pri" id="sendBtn" onclick="send()">CPZへ送る</button>
   <button id="reBtn" onclick="reopen()" hidden>範囲を選び直す</button>
   <button onclick="clr()">クリア</button></div>
   <div id="list"></div>
+  <details class="pc" id="pc" ontoggle="pcInfo()"><summary>PCから使う (hexaclip コマンド)</summary>
+    <p>Python 3 があれば Windows / Mac / Linux で使えます。PCのブラウザなら、この画面にファイルを
+    ドラッグ&amp;ドロップしても送れます。</p>
+    <p>1. <a href="/hexaclip.py" style="color:var(--acc)">hexaclip.py をダウンロード</a></p>
+    <p>2. 最初に1回だけ (接続先とトークンを保存):</p><pre id="pcsetup">…</pre>
+    <button onclick="cpText($('pcsetup').textContent)">コピー</button>
+    <p>3. 使い方:</p><pre># ファイルを送る
+python hexaclip.py send main.py data.pdf
+# PCのクリップボードを送る / 最新をPCのクリップボードへ
+python hexaclip.py push --clip
+python hexaclip.py paste --clip
+# 最新のファイルを保存 / 履歴
+python hexaclip.py get
+python hexaclip.py list</pre>
+  </details>
 </main></div>
+<div id="drop" hidden>ドロップして CPZ へ送る</div>
 <div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);let rev=null,items=[],editing=null,src=null,sel=null,drag=null;
@@ -336,12 +420,16 @@ $('pin').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
 function fmt(t){const d=new Date(t*1000),o={hour:'2-digit',minute:'2-digit'};
  if(d.toDateString()!==new Date().toDateString()){o.month='numeric';o.day='numeric'}return d.toLocaleString('ja-JP',o)}
 function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-function render(){$('list').innerHTML=items.length?items.map((i,n)=>`<div class="item${n?'':' top'}"><pre>${esc(i.text)}</pre>
+function fsize(n){return n<1024?n+'B':n<1048576?(n/1024).toFixed(1)+'KB':(n/1048576).toFixed(1)+'MB'}
+function render(){$('list').innerHTML=items.length?items.map((i,n)=>{const dl=`<a href="/api/files/${i.id}" download>
+ <button>DL</button></a>`;return `<div class="item${n?'':' top'}">
+ ${i.name?`<div class="fhead"><b>${esc(i.name)}</b><span>${fsize(i.size)}</span></div>`:''}
+ ${i.binary?`<div class="bin">ファイル (本体の ~/clip/${esc(i.name)})</div>`:`<pre>${esc(i.text)}</pre>`}
  <div class="meta"><span class="src">${esc(i.source)}</span><span>${fmt(i.created)}</span>
- ${n?'':'<span class="fnv">fn+V</span>'}<span class="sp"></span>
- <button onclick="del(${i.id})">削除</button><button onclick="edit(${i.id})">編集</button>
- ${n?`<button onclick="toTop(${i.id})" title="本体の fn+V で貼り付ける対象にする">貼付用</button>`:''}
- <button class="pri" onclick="cp(${i.id})">コピー</button></div></div>`).join('')
+ ${n||i.binary?'':'<span class="fnv">fn+V</span>'}<span class="sp"></span>
+ <button onclick="del(${i.id})">削除</button>${i.binary?'':`<button onclick="edit(${i.id})">編集</button>`}
+ ${n&&!i.binary?`<button onclick="toTop(${i.id})" title="本体の fn+V で貼り付ける対象にする">貼付用</button>`:''}
+ ${i.name?dl:''}${i.binary?'':`<button class="pri" onclick="cp(${i.id})">コピー</button>`}</div></div>`}).join('')
  :'<div class="empty">まだ何もありません</div>'}
 function online(ok){$('st').textContent=ok?'● 接続中':'● 切断';$('st').style.color=ok?'var(--acc)':'#ff6b6b'}
 async function load(){try{const r=await api('/api/items?limit=50');items=r.items;rev=r.rev;render();online(true)
@@ -350,7 +438,10 @@ async function load(){try{const r=await api('/api/items?limit=50');items=r.items
 async function poll(){try{const r=await api('/api/ping');online(true);if(r.rev!==rev)await load()}
  catch(e){if(e!==401)online(false)}}
 async function send(){const v=$('t').value;if(!v.trim())return;const b=$('sendBtn');b.disabled=true;
+ const nm=$('fname').value.trim();
  try{if(editing){await api('/api/items/'+editing,{method:'PUT',body:JSON.stringify({text:v})});toast('保存しました')}
+ else if(nm){const r=await upload(new Blob([v.endsWith('\n')?v:v+'\n'],{type:'text/plain'}),nm);
+  if(!r)return;toast('~/clip/'+r.name+' に保存しました');$('fname').value=''}
  else{await api('/api/items',{method:'POST',body:JSON.stringify({text:v,source:lastOcr?'cam':'web'})});toast('送りました')}
  $('t').value='';lastOcr=false;unsure=[];showUnsure();endEdit(false);load()}catch(e){toast('失敗')}finally{b.disabled=false}}
 function clr(){$('t').value='';lastOcr=false;unsure=[];showUnsure();endEdit(false)}
@@ -358,16 +449,36 @@ async function del(id){if(!confirm('#'+id+' を削除しますか?'))return;
  try{await api('/api/items/'+id,{method:'DELETE'})}catch(e){}load()}
 async function toTop(id){try{await api('/api/items/'+id+'/top',{method:'POST',body:'{}'});
  toast('貼付用にしました (本体で fn+V)');load()}catch(e){toast('失敗')}}
-function edit(id){const it=items.find(i=>i.id===id);if(!it)return;editing=id;$('t').value=it.text;
+function edit(id){const it=items.find(i=>i.id===id);if(!it||it.binary)return;editing=id;$('t').value=it.text;
+ $('fname').value='';$('fname').disabled=true;
  $('t').classList.add('editing');$('editbar').hidden=false;$('edlabel').textContent='#'+id+' を編集中';
  $('sendBtn').textContent='保存';scrollTo({top:0,behavior:'smooth'});$('t').focus()}
-function endEdit(clear){if(clear&&editing)$('t').value='';editing=null;$('t').classList.remove('editing');
+function endEdit(clear){if(clear&&editing)$('t').value='';editing=null;$('fname').disabled=false;$('t').classList.remove('editing');
  $('editbar').hidden=true;$('sendBtn').textContent='CPZへ送る'}
-function cp(id){const s=items.find(i=>i.id===id).text;
+function cp(id){cpText(items.find(i=>i.id===id).text)}
+function cpText(s){
  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(s).then(()=>toast('コピーしました'))}
  else{const ta=document.createElement('textarea');ta.value=s;ta.style.position='fixed';ta.style.opacity='0';
  document.body.appendChild(ta);ta.focus();ta.select();ta.setSelectionRange(0,s.length);
  try{document.execCommand('copy');toast('コピーしました')}catch(e){toast('コピー失敗')}ta.remove()}}
+
+// ---- ファイル送信 (ボタン / ドラッグ&ドロップ)。進み具合が出るよう XHR を使う
+function upload(blob,name){return new Promise(ok=>{const x=new XMLHttpRequest();
+ x.open('POST','/api/files?name='+encodeURIComponent(name)+'&source=web');x.withCredentials=true;
+ x.upload.onprogress=e=>{if(e.lengthComputable&&e.total>200000)toast(`${name} ${Math.round(e.loaded/e.total*100)}%`,4000)};
+ x.onload=()=>{let j={};try{j=JSON.parse(x.responseText)}catch(e){}
+  if(x.status==401){show(false);ok(null)}else if(x.status!=200){toast(`${name}: ${j.error||x.status}`,3500);ok(null)}else ok(j)};
+ x.onerror=()=>{toast(name+': 送信失敗',3000);ok(null)};x.send(blob)})}
+async function sendFiles(list){let n=0;for(const f of list){if(await upload(f,f.name))n++}
+ if(n)toast(n==1?'~/clip/ に保存しました':`${n}個のファイルを ~/clip/ に保存しました`,2500);load()}
+$('files').onchange=e=>{const l=[...e.target.files];e.target.value='';if(l.length)sendFiles(l)};
+let dragN=0;addEventListener('dragenter',e=>{if(e.dataTransfer.types.includes('Files')&&!$('app').hidden){dragN++;$('drop').hidden=false}});
+addEventListener('dragleave',()=>{if(--dragN<=0){dragN=0;$('drop').hidden=true}});
+addEventListener('dragover',e=>{if(e.dataTransfer.types.includes('Files'))e.preventDefault()});
+addEventListener('drop',e=>{if(!e.dataTransfer.files.length)return;e.preventDefault();dragN=0;$('drop').hidden=true;
+ if(!$('app').hidden)sendFiles([...e.dataTransfer.files])});
+async function pcInfo(){if(!$('pc').open)return;try{const r=await api('/api/token');
+ $('pcsetup').textContent=`python hexaclip.py setup ${location.origin} ${r.token}`}catch(e){}}
 
 // ---- 撮影 → 範囲選択 → 本体でOCR
 const MAXSRC=3000,MAXFULL=2000;let lastOcr=false,unsure=[];
@@ -552,6 +663,18 @@ class Handler(BaseHTTPRequestHandler):
     # routes
     def _do_GET(self):
         u = urlparse(self.path)
+        if u.path == "/hexaclip.py":          # PC用コマンドの配布 (秘密情報は含まない)
+            try:
+                body = open(PC_TOOL, "rb").read()
+            except OSError:
+                return self.send_json({"error": "not found"}, 404)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/x-python; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="hexaclip.py"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if u.path == "/":
             body = PAGE.encode()
             self.send_response(200)
@@ -585,14 +708,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"pin": self.app.pin, "url": f"http://{ip}:{port}/",
                                    "online": ip != "127.0.0.1",
                                    "mdns": f"http://{m}:{port}/" if m else None})
-        if u.path == "/api/token" and self.is_local():
+        if u.path == "/api/token":             # ログイン済みの画面にも出す (同じ権限なので)
             return self.send_json({"token": self.app.token})
+        if u.path.startswith("/api/files/"):
+            return self.get_file(int(u.path.rsplit("/", 1)[1]))
         self.send_json({"error": "not found"}, 404)
 
     def _do_POST(self):
         u = urlparse(self.path)
         if u.path == "/api/ocr":
             return self.post_ocr(u)
+        if u.path == "/api/files":
+            return self.post_file(u)
         try:
             data = self.read_json()
         except Exception:
@@ -651,6 +778,97 @@ class Handler(BaseHTTPRequestHandler):
         print(f"ocr {lang} {len(data)//1024}KB {dt:.1f}s {len(text)}chars", flush=True)
         return self.send_json({"text": text, "elapsed": dt, "marks": marks})
 
+    def post_file(self, u):
+        """ファイルを名前付きで受け取る: 本文=ファイルの中身、?name=ファイル名
+        テキスト(UTF-8, 256KB以下)は履歴に本文も入り、本体の fn+V / 編集 / コピーができる。
+        それ以外 (PDF・画像など) は ~/clip/ に保存し、履歴からダウンロードできる"""
+        if not self.authed():
+            return self.send_json({"error": "auth"}, 401)
+        q = parse_qs(u.query)
+        name = safe_name(q.get("name", [""])[0])
+        if not name:
+            return self.send_json({"error": "ファイル名がありません"}, 400)
+        n = int(self.headers.get("Content-Length", 0))
+        if n <= 0:
+            return self.send_json({"error": "空のファイルです"}, 400)
+        if n > MAX_FILE:
+            return self.send_json({"error": f"{MAX_FILE // 1024 // 1024}MBまでです"}, 413)
+        src = str(q.get("source", ["web"])[0])[:16]
+        os.makedirs(FILES_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=FILES_DIR, prefix=".upload_")
+        try:
+            left = n
+            with os.fdopen(fd, "wb") as f:
+                while left > 0:
+                    chunk = self.rfile.read(min(left, 256 * 1024))
+                    if not chunk:
+                        raise ConnectionError("short body")
+                    f.write(chunk)
+                    left -= len(chunk)
+            text = None
+            if n <= MAX_TEXT:
+                raw = open(tmp, "rb").read()
+                if b"\0" not in raw:
+                    try:
+                        text = raw.decode("utf-8-sig")
+                    except UnicodeDecodeError:
+                        text = None
+            if text is not None:             # Windowsの改行やBOMはそろえる (本体はLinux)
+                text = text.replace("\r\n", "\n").replace("\r", "\n")
+                write_text_file(tmp, text)
+            final = place_file(tmp, name)
+        except ConnectionError:
+            return self.send_json({"error": "途中で切れました"}, 400)
+        except OSError as e:
+            print("file save failed:", e, flush=True)
+            return self.send_json({"error": "保存できません (容量不足?)"}, 507)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        size = os.path.getsize(final)
+        new = self.app.store.add(text if text is not None else "", src, name=name, path=final,
+                                 size=size, binary=text is None, trim=False)
+        print(f"file {name} {size}B {'text' if text is not None else 'binary'} -> #{new}", flush=True)
+        return self.send_json({"id": new, "name": name, "size": size, "binary": text is None,
+                               "path": final})
+
+    def get_file(self, item_id):
+        """ダウンロード。名前付きはその名前で、名前なしは clip_<ID>.txt"""
+        it = self.app.store.get(item_id)
+        if not it:
+            return self.send_json({"error": "not found"}, 404)
+        name = it["name"] or f"clip_{it['id']}.txt"
+        ascii_name = "".join(c if c.isascii() and c.isprintable() and c not in '"\\' else "_"
+                             for c in name)
+        disp = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}"
+        if not it["binary"]:
+            body = it["text"].encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition", disp)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        path = it["path"]
+        if not path or not os.path.exists(path):
+            return self.send_json({"error": "本体のファイルが削除されています"}, 404)
+        if os.path.getsize(path) != it["size"]:
+            return self.send_json({"error": "同じ名前の新しいファイルで上書きされています"}, 410)
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(name)[0] or "application/octet-stream")
+        self.send_header("Content-Disposition", disp)
+        self.send_header("Content-Length", str(it["size"]))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(256 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
     def _do_PUT(self):
         if not self.authed():
             return self.send_json({"error": "auth"}, 401)
@@ -666,7 +884,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(text.encode()) > MAX_TEXT:
                 return self.send_json({"error": "too large"}, 413)
             ok = self.app.store.update(int(u.path.rsplit("/", 1)[1]), text)
-            return self.send_json({"ok": ok}, 200 if ok else 404)
+            return self.send_json({"ok": ok}, 200 if ok else 404)   # バイナリも 404 (編集不可)
         self.send_json({"error": "not found"}, 404)
 
     def _do_DELETE(self):

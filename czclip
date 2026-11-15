@@ -3,6 +3,7 @@
 
   czclip paste [N]        最新(またはN番目に新しい)を出力   例: czclip paste > main.py
   czclip push [TEXT...]   送る(TEXT省略時は標準入力)         例: czclip push < log.txt
+  czclip send FILE...     ファイルを名前付きで送る (スマホ/PCの履歴からDLできる)
   czclip list [N]         履歴一覧(既定10件)
   czclip get ID           ID指定で出力
   czclip rm ID            削除
@@ -59,10 +60,32 @@ def main(argv):
         text = " ".join(args) if args else sys.stdin.read()
         r = call("POST", "/api/items", {"text": text, "source": "cli"})
         print(f"pushed #{r['id']}", file=sys.stderr)
+    elif cmd == "send":
+        if not args:
+            sys.exit("czclip: send にはファイルを指定してください (例: czclip send log.txt)")
+        from urllib.parse import quote
+        for path in args:
+            try:
+                data = open(path, "rb").read()
+            except OSError as e:
+                sys.exit(f"czclip: {path}: {e.strerror}")
+            req = urllib.request.Request(
+                BASE + "/api/files?source=cli&name=" + quote(os.path.basename(path)),
+                data=data, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    j = json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                sys.exit(f"czclip: {path}: error {e.code} {e.read().decode(errors='replace')}")
+            except urllib.error.URLError:
+                sys.exit("czclip: czclipd に接続できません (systemctl status hexaclip を確認)")
+            print(f"sent #{j['id']} {j['name']} ({j['size']}B)", file=sys.stderr)
     elif cmd == "list":
         n = int(args[0]) if args else 10
         for it in call("GET", f"/api/items?limit={n}")["items"]:
-            print(f"#{it['id']:<5} [{it['source']:<4}] {one_line(it['text'])}")
+            body = f"({it.get('size', 0)}B)" if it.get("binary") else one_line(it["text"])
+            name = f"{it['name']}: " if it.get("name") else ""
+            print(f"#{it['id']:<5} [{it['source']:<4}] {one_line(name + body)}")
     elif cmd == "get":
         sys.stdout.write(call("GET", f"/api/items/{int(args[0])}")["text"])
     elif cmd == "top":

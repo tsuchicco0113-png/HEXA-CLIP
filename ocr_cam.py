@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v0.7.2)
+"""HEXA CLIP — CardputerZero 用アプリ (v0.8)
 
 4つのモードを上のタブで切り替える:
   1 クリップ : カメラで文字を読み取り → 修正 → HEXA CLIPへ送る
@@ -37,7 +37,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.7.2"
+VERSION = "0.8"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -573,6 +573,11 @@ def to_top(item_id):
         return None
 
 
+def fsize(n):
+    n = n or 0
+    return f"{n}B" if n < 1024 else f"{n / 1024:.1f}KB" if n < 1048576 else f"{n / 1048576:.1f}MB"
+
+
 def save_file(text, name):
     os.makedirs(CLIP_DIR, exist_ok=True)
     p = os.path.join(CLIP_DIR, name)
@@ -1008,10 +1013,18 @@ class App:
                     d.rectangle((0, y, 2, y + self.ROW_H - 1), fill=ACC)
                 d.text((6, y + 3), it["source"][:3], fill=colors.get(it["source"], SUB),
                        font=self.font_s)
-                if i == 0:                      # fn+V で貼り付けられる項目
+                if i == 0 and not it.get("binary"):   # fn+V で貼り付けられる項目
                     d.text((LCD_W - 40, y + 3), "fn+V", fill=ACC, font=self.font_s)
                 lim = LCD_W - (84 if i == 0 else 44)
-                d.text((34, y + 3), self.ellipsize(it["text"], lim), fill=FG, font=self.font_s)
+                x = 34
+                if it.get("name"):              # ファイル: 名前を水色で先に出す
+                    nm = self.ellipsize(it["name"], lim * 0.6)
+                    d.text((x, y + 3), nm, fill=(120, 200, 255), font=self.font_s)
+                    w = self.font_s.getlength(nm) + 6
+                    x, lim = x + w, lim - w
+                body = fsize(it.get("size", 0)) if it.get("binary") else it["text"]
+                d.text((x, y + 3), self.ellipsize(body, lim), fill=FG if not it.get("binary") else SUB,
+                       font=self.font_s)
             if len(self.items) > self.ROWS:
                 h = self.ROWS * self.ROW_H
                 bh = max(8, h * self.ROWS // len(self.items))
@@ -1037,6 +1050,8 @@ class App:
     def run_detail(self, item):
         """全文表示(モーダル)"""
         item = clip_get(item)
+        if item.get("binary"):
+            return self.run_file_detail(item)
         A = self.AR
         text, scroll, armed, note = item["text"], 0, False, ""
         rows = (LCD_H - TOP_H - BOT_H - 2) // 20
@@ -1057,7 +1072,8 @@ class App:
                 by = TOP_H + 2 + (h - bh) * scroll // max(1, len(lines) - rows)
                 d.rectangle((LCD_W - 3, by, LCD_W - 1, by + bh), fill=(90, 98, 115))
             when = datetime.datetime.fromtimestamp(item["created"]).strftime("%m/%d %H:%M")
-            title = note or f"#{item['id']}  {item['source']}  {when}  {len(text)}文字"
+            head = item.get("name") or f"#{item['id']}  {item['source']}"
+            title = note or f"{head}  {when}  {len(text)}文字"
             hint = ("もう一度 D で削除 / 他のキーで中止" if armed
                     else f"{A['u']}{A['d']}:送り V:貼付用 E:編集 S:保存 D:削除")
             self.fb.show(self.chrome(img, hint, tabs=False, title=title))
@@ -1087,8 +1103,11 @@ class App:
                     self.make_paste_target(item)
                     return
                 elif key == "s":
-                    p = save_file(text, f"clip_{item['id']}.txt")
-                    note = "保存: ~/clip/" + os.path.basename(p)
+                    if item.get("name"):
+                        note = "保存済み: ~/clip/" + item["name"]
+                    else:
+                        p = save_file(text, f"clip_{item['id']}.txt")
+                        note = "保存: ~/clip/" + os.path.basename(p)
                 elif key == "e":
                     out = self.run_editor(text)
                     if out and out.strip() and out != text:
@@ -1096,7 +1115,54 @@ class App:
                         return
                     self.keys.flush(0.1)
 
+    def run_file_detail(self, item):
+        """バイナリ (PDF・画像など): 内容は表示せず、場所と大きさだけ"""
+        when = datetime.datetime.fromtimestamp(item["created"]).strftime("%m/%d %H:%M")
+        path = item.get("path") or ""
+        if not path or not os.path.exists(path):
+            warn = "※ 本体のファイルが見つかりません"
+        elif os.path.getsize(path) != item.get("size"):
+            warn = "※ 同じ名前の新しいファイルで上書き済み"
+        else:
+            warn = ""
+        armed = False
+        self.keys.flush(0.2)
+        while True:
+            img = self.canvas()
+            d = ImageDraw.Draw(img)
+            rows = [(item.get("name") or "", (120, 200, 255), self.font),
+                    (f"{fsize(item.get('size', 0))}  {item['source']}  {when}", SUB, self.font_s),
+                    ("保存先:", SUB, self.font_s),
+                    ("~/clip/" + (item.get("name") or ""), FG, self.font_s),
+                    (warn, (255, 170, 60), self.font_s),
+                    ("スマホ/PCの履歴から DL できます", SUB, self.font_s)]
+            y = TOP_H + 6
+            for txt, col, f in rows:
+                d.text((8, y), self.ellipsize(txt, LCD_W - 16) if txt else "", fill=col, font=f)
+                y += 22 if f is self.font else 18
+            hint = "もう一度 D で履歴から削除 / 他のキーで中止" if armed else "ESC:戻る  D:履歴から削除 (ファイルは残る)"
+            self.fb.show(self.chrome(img, hint, tabs=False, title=f"#{item['id']}  ファイル"))
+            for kind, val in nav(self.keys.poll(0.5)):
+                key = val.lower() if kind == "CHAR" else val
+                if armed:
+                    armed = False
+                    if key == "d":
+                        try:
+                            clip_call("DELETE", f"/api/items/{item['id']}")
+                            self.say(f"#{item['id']} を履歴から削除")
+                        except Exception:
+                            self.say("削除できませんでした")
+                        return
+                    continue
+                if key in ("ESC", "LEFT"):
+                    return
+                if key == "d":
+                    armed = True
+
     def make_paste_target(self, item):
+        if item.get("binary"):
+            self.say("ファイルは fn+V できません (~/clip/ にあります)", 3)
+            return
         note = paste_note(clip_get(item)["text"])
         if self.items and item["id"] == self.items[0]["id"]:
             self.say(note or "貼付用です  ESCで閉じて fn+V", 4 if note else 3)
@@ -1223,7 +1289,8 @@ class App:
         self.last_id = it[0]["id"]
         if it[0]["source"] in ("ocr", "edit") or it[0].get("moved"):
             return
-        self.say(f"受信 #{it[0]['id']} ({it[0]['source']})", 3)
+        self.say(f"受信 {it[0]['name']}" if it[0].get("name")
+                 else f"受信 #{it[0]['id']} ({it[0]['source']})", 3)
         self.next_list = 0.0
         if self.st["auto_show"]:
             self.set_mode(M_HIST)
