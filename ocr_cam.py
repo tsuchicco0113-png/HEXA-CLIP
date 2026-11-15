@@ -926,12 +926,14 @@ def draw_icon(d, kind, cx, cy, s, col):
         d.ellipse((cx - s * 0.12, cy - s * 0.12, cx + s * 0.12, cy + s * 0.12), fill=col)
 
 
-MASCOT_H = 58
+MASCOT_H = LCD_H - TOP_H - BOT_H - 2      # 全身を縦いっぱいに (顔が分かる大きさ)
+MASCOT_MAX_W = 66                          # これより横に広いポーズは小さめに
 
 
 def load_mascot():
     """assets/mascot/ の立ち絵 (ゴマエビちゃん)。idle.png = ふだん / happy.png = 受信した時
-    無ければ何も出さない。白ふち付きの透過PNGをそのまま置けば、本体用に縮める"""
+    無ければ何も出さない。白ふち付きの透過PNGをそのまま置けば、本体用に縮める
+    (横に広いポーズは幅を抑えて、説明文の場所を残す)"""
     out = {}
     for key in ("idle", "happy"):
         p = os.path.join(ASSET_DIR, "mascot", key + ".png")
@@ -940,8 +942,8 @@ def load_mascot():
             bbox = im.getbbox()
             if bbox:
                 im = im.crop(bbox)
-            k = MASCOT_H / im.height
-            out[key] = im.resize((max(1, int(im.width * k)), MASCOT_H), Image.LANCZOS)
+            k = min(MASCOT_H / im.height, MASCOT_MAX_W / im.width)
+            out[key] = im.resize((max(1, int(im.width * k)), max(1, int(im.height * k))), Image.LANCZOS)
         except (OSError, ValueError):
             pass
     if "happy" not in out and "idle" in out:
@@ -1088,9 +1090,9 @@ class App:
         self.set_mode(m)
 
     # ---- ホーム (ハニカム)
-    HOME_POS = [(52, 62), (104, 62), (78, 108), (130, 108)]   # 2x2 のハニカム
-    HOME_DESC = {M_HIST: "受け取ったもの", M_QR: "スマホ・PCをつなぐ",
-                 M_CLIP: "おまけ: 文字・QRを読む", M_SET: "受信 / fn+V / カメラ"}
+    HOME_POS = [(40, 62), (92, 62), (66, 108), (118, 108)]    # 2x2 のハニカム
+    HOME_DESC = {M_HIST: "受け取ったもの", M_QR: "スマホ・PCと",
+                 M_CLIP: "文字・QR (おまけ)", M_SET: "受信・fn+V・カメラ"}
 
     def status_text(self):
         """右上: Wi-Fi (IPの末尾) と電池。15秒ごとに取り直す"""
@@ -1139,19 +1141,20 @@ class App:
                 d.ellipse((bx - 8, by - 8, bx + 8, by + 8), fill=(255, 170, 40))
                 n = str(min(self.unseen, 99))
                 d.text((bx - self.font_t.getlength(n) / 2, by - 7), n, fill=(20, 20, 20), font=self.font_t)
-        # 右の説明パネル
-        x0 = 170
+        # 右の説明パネル (ゴマエビちゃんがいれば、その左までに収める)
+        x0 = 156
+        mw = max(m.width for m in self.mascot.values()) if self.mascot else 0
+        right = LCD_W - 6 - (mw + 2 if mw else 0)
         d.text((x0, 22), SCREEN_NAMES[sel], fill=FG, font=self.font_b)
         desc = self.HOME_DESC[sel]
         if sel == M_HIST and self.items is not None:
-            desc += f" {len(self.items)}件"
+            desc = f"{len(self.items)}件"
         if sel == M_CLIP and self.cam is None:
-            desc = "カメラが見つかりません"
+            desc = "カメラなし"
         if self.items is None:
             desc = "HEXA CLIP が停止中"
-        d.text((x0, 50), desc, fill=SUB, font=self.font_s)
-        d.line((x0, 68, LCD_W - 6, 68), fill=(44, 50, 64))
-        right = LCD_W - 6 - (self.mascot["idle"].width + 4 if self.mascot else 0)
+        d.text((x0, 50), self.ellipsize(desc, right - x0), fill=SUB, font=self.font_s)
+        d.line((x0, 68, right, 68), fill=(44, 50, 64))
         d.text((x0, 72), "fn+V で貼れる", fill=ACC, font=self.font_t)
         d.rounded_rectangle((x0, 87, max(x0 + 60, right), 117), 4, fill=(18, 22, 30), outline=(44, 50, 64))
         if latest:
@@ -1165,7 +1168,7 @@ class App:
             d.text((x0, 124), f"● 新着 {self.unseen}件", fill=(255, 190, 70), font=self.font_bs)
         if self.mascot:                          # ゴマエビちゃん
             m = self.mascot["happy" if happy else "idle"]
-            img.paste(m, (LCD_W - m.width - 3, LCD_H - BOT_H - m.height - 1), m)
+            img.paste(m, (LCD_W - 3 - (mw + m.width) // 2, LCD_H - BOT_H - m.height - 1), m)
         self.home_cache = (key, img.copy())
         return self.chrome(img, self.home_hint())
 
