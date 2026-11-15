@@ -3,7 +3,8 @@
 
 ﾌﾟﾚﾋﾞｭｰ → ENTERで撮影・OCR → 編集画面で修正 → ENTERでHEXA CLIPへ送る
 
-  プレビュー : ENTER=読み取り  ESC=終了
+  プレビュー : ENTER=読み取り  Z=ズーム切替(x1/x2)  Q=スマホ接続QR  ESC=終了
+               撮影は全画素(3280x2464)で行う (--no-hires で無効)
                枠の色/FOCUSバー 緑=ピント良 黄=まあまあ 赤=ボケ
   編集画面   : ←→↑↓=カーソル  BS=1文字削除  DEL=後ろを削除  TAB=改行
                英数字・記号=挿入 (日本語の入力は不可)
@@ -38,15 +39,20 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-VERSION = "0.3.1"
+VERSION = "0.4"
 LCD_W, LCD_H = 320, 170
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
-LORES_W, LORES_H = 400, 300          # プレビュー用(同じ画角)
+FULL_W, FULL_H = 3280, 2464          # 撮影用の全画素
+LORES_W, LORES_H = 640, 480          # プレビュー用(同じ画角)
+ZOOMS = [0.6, 0.3]                   # プレビューに映す横幅(全画角に対する割合) x1 / x2
+STILL_CFG = None                     # 全画素撮影の設定(open_cameraで作る)
 
-VIEW_CW = 0.6                        # プレビューに映す範囲(中央を少しズーム)
-VIEW_CH = VIEW_CW * (MAIN_W / MAIN_H) / (LCD_W / LCD_H)
-VIEW_X0 = (1 - VIEW_CW) / 2
-VIEW_Y0 = (1 - VIEW_CH) / 2
+
+def view_rect(cw):
+    """映す範囲 (x0, y0, w, h) を全画角に対する割合で返す"""
+    ch = cw * (MAIN_W / MAIN_H) / (LCD_W / LCD_H)
+    return (1 - cw) / 2, (1 - ch) / 2, cw, ch
+
 BOX = (24, 58, 296, 112)             # 読み取り枠(LCD座標)
 
 CLIP_URL = os.environ.get("HEXACLIP_URL", "http://127.0.0.1:8080")
@@ -225,7 +231,14 @@ def find_font(size):
 def open_camera():
     from libcamera import Transform
     from picamera2 import Picamera2
+    global STILL_CFG
     cam = Picamera2()
+    try:
+        STILL_CFG = cam.create_still_configuration(
+            main={"size": (FULL_W, FULL_H), "format": "YUV420"},
+            transform=Transform(hflip=1, vflip=1), buffer_count=1)
+    except Exception as e:
+        print("hires config failed:", e)
     cam.configure(cam.create_preview_configuration(
         main={"size": (MAIN_W, MAIN_H), "format": "YUV420"},
         lores={"size": (LORES_W, LORES_H), "format": "YUV420"},
@@ -247,11 +260,21 @@ class Preview:
         self.font_s = font_s
         self.peak = 1.0
         self.toast = ("", 0.0)
+        self.zoom = 0
+
+    @property
+    def cw(self):
+        return ZOOMS[self.zoom]
+
+    def toggle_zoom(self):
+        self.zoom = (self.zoom + 1) % len(ZOOMS)
+        self.peak = 1.0
 
     def frame(self, cam):
         y = cam.capture_array("lores")[:LORES_H, :LORES_W]
-        x0, y0 = int(VIEW_X0 * LORES_W), int(VIEW_Y0 * LORES_H)
-        x1, y1 = int((VIEW_X0 + VIEW_CW) * LORES_W), int((VIEW_Y0 + VIEW_CH) * LORES_H)
+        vx, vy, vw_, vh_ = view_rect(self.cw)
+        x0, y0 = int(vx * LORES_W), int(vy * LORES_H)
+        x1, y1 = int((vx + vw_) * LORES_W), int((vy + vh_) * LORES_H)
         view = np.ascontiguousarray(y[y0:y1, x0:x1])
         vh, vw = view.shape
         bx0, by0, bx1, by1 = BOX
@@ -265,11 +288,12 @@ class Preview:
         col = (0, 255, 120) if ratio > 0.8 else (255, 200, 0) if ratio > 0.5 else (255, 80, 80)
         d.rectangle(BOX, outline=col, width=2)
         d.rectangle((0, LCD_H - 16, LCD_W, LCD_H), fill=(0, 0, 0))
-        d.text((4, LCD_H - 15), "ENTER:read ESC:quit", fill=(255, 255, 255), font=self.font_s)
-        bx = 190
-        d.text((bx - 34, LCD_H - 15), "FOCUS", fill=(200, 200, 200), font=self.font_s)
-        d.rectangle((bx, LCD_H - 12, bx + 120, LCD_H - 4), outline=(120, 120, 120))
-        d.rectangle((bx, LCD_H - 12, bx + int(120 * ratio), LCD_H - 4), fill=col)
+        d.text((4, LCD_H - 15), f"ENTER:読取 Z:x{self.zoom + 1} Q:接続", fill=(255, 255, 255),
+               font=self.font_s)
+        bx = 214
+        d.text((bx - 40, LCD_H - 15), "FOCUS", fill=(200, 200, 200), font=self.font_s)
+        d.rectangle((bx, LCD_H - 12, bx + 100, LCD_H - 4), outline=(120, 120, 120))
+        d.rectangle((bx, LCD_H - 12, bx + int(100 * ratio), LCD_H - 4), fill=col)
         msg, until = self.toast
         if msg and time.time() < until:
             w = int(self.font_s.getlength(msg)) + 16
@@ -278,21 +302,43 @@ class Preview:
         return img
 
 
-def box_to_main():
+def box_frac(cw):
+    """読み取り枠の範囲を全画角に対する割合で返す"""
+    vx, vy, vw, vh = view_rect(cw)
     bx0, by0, bx1, by1 = BOX
-    return (int((VIEW_X0 + bx0 / LCD_W * VIEW_CW) * MAIN_W),
-            int((VIEW_Y0 + by0 / LCD_H * VIEW_CH) * MAIN_H),
-            int((VIEW_X0 + bx1 / LCD_W * VIEW_CW) * MAIN_W),
-            int((VIEW_Y0 + by1 / LCD_H * VIEW_CH) * MAIN_H))
+    return (vx + bx0 / LCD_W * vw, vy + by0 / LCD_H * vh,
+            vx + bx1 / LCD_W * vw, vy + by1 / LCD_H * vh)
 
 
-def capture_crop(cam):
-    y = cam.capture_array("main")[:MAIN_H, :MAIN_W]
-    x0, y0, x1, y1 = box_to_main()
-    img = Image.fromarray(np.ascontiguousarray(y[y0:y1, x0:x1]))
-    if img.width > 1000:
-        img = img.resize((1000, int(img.height * 1000 / img.width)), Image.BILINEAR)
+def prepare(img):
+    """OCR向けの前処理: 白地に黒へそろえる / 小さい切り出しは拡大 / 大きすぎれば縮小"""
+    if np.asarray(img).mean() < 110:            # 暗い背景(ダークモードの画面など)は反転
+        img = ImageOps.invert(img)
+    if img.width < 900:                         # 小さい文字: 2倍に拡大
+        img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+    elif img.width > 1400:
+        img = img.resize((1400, int(img.height * 1400 / img.width)), Image.LANCZOS)
     return ImageOps.autocontrast(img, cutoff=1)
+
+
+def capture_crop(cam, cw, hires=True):
+    """枠内を切り出す。hires=True なら全画素モードに切り替えて撮る"""
+    y, W, H = None, MAIN_W, MAIN_H
+    if hires and STILL_CFG is not None:
+        try:
+            y = cam.switch_mode_and_capture_array(STILL_CFG, "main")
+            W, H = FULL_W, FULL_H
+        except Exception as e:
+            print("hires capture failed, fallback:", e)
+            y = None
+    if y is None:
+        y = cam.capture_array("main")
+        W, H = MAIN_W, MAIN_H
+    f = box_frac(cw)
+    x0, y0, x1, y1 = int(f[0] * W), int(f[1] * H), int(f[2] * W), int(f[3] * H)
+    img = Image.fromarray(np.ascontiguousarray(y[:H, :W][y0:y1, x0:x1]))
+    img.save("/tmp/ocr_cam_raw.png")
+    return prepare(img)
 
 
 def run_ocr(img, lang, psm, min_conf=60.0):
@@ -344,6 +390,58 @@ def send_clip(text):
             for q in (CLIP_DIR, p):
                 os.chown(q, int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
         return "CLIP停止中 → ファイル保存"
+
+
+def clip_get(path, timeout=1.0):
+    with urllib.request.urlopen(CLIP_URL + path, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def latest_item():
+    try:
+        items = clip_get("/api/items?limit=1", 0.5)["items"]
+        return items[0] if items else None
+    except Exception:
+        return None
+
+
+def connect_screen(font, font_s):
+    """スマホ接続用の画面: QRコード(読むだけでログイン) + URL + PIN"""
+    img = Image.new("RGB", (LCD_W, LCD_H), (14, 16, 22))
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, LCD_W, 17), fill=(0, 90, 60))
+    d.text((4, 1), "スマホ接続  (同じWi-Fiで)", fill=(255, 255, 255), font=font_s)
+    try:
+        info = clip_get("/api/pin")
+    except Exception:
+        d.text((6, 40), "HEXA CLIP が停止中です", fill=(255, 120, 120), font=font)
+        d.text((6, 66), "sudo systemctl start hexaclip", fill=(200, 200, 200), font=font_s)
+        return img
+    url, pin = info["url"], info["pin"]
+    x_text = 6
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=2, box_size=1,
+                           error_correction=qrcode.constants.ERROR_CORRECT_L)
+        qr.add_data(url + "#pin=" + pin)
+        qr.make(fit=True)
+        m = np.array(qr.get_matrix(), dtype=np.uint8)
+        scale = max(1, 148 // m.shape[0])
+        q = Image.fromarray((1 - m) * 255).resize(
+            (m.shape[1] * scale, m.shape[0] * scale), Image.NEAREST)
+        img.paste(q, (4, 19 + (148 - q.height) // 2))
+        x_text = 4 + q.width + 8
+    except ImportError:
+        d.text((6, 120), "QR: sudo apt install python3-qrcode", fill=(255, 200, 0), font=font_s)
+    host = url.replace("http://", "").rstrip("/")
+    d.text((x_text, 26), "QRを読む か URL:", fill=(150, 158, 175), font=font_s)
+    for i, part in enumerate(host.split(":")):
+        d.text((x_text, 44 + i * 18), part if i == 0 else ":" + part,
+               fill=(235, 238, 245), font=font_s)
+    d.text((x_text, 90), "PIN", fill=(150, 158, 175), font=font_s)
+    d.text((x_text, 104), pin, fill=(47, 214, 123), font=font)
+    d.text((x_text, 148), "何かキーで戻る", fill=(150, 158, 175), font=font_s)
+    return img
 
 
 # ---------------------------------------------------------------- editor
@@ -507,6 +605,7 @@ def main():
     ap.add_argument("--debug-keys", action="store_true")
     ap.add_argument("--keys", help="キー割り当てJSON")
     ap.add_argument("--no-pause", action="store_true", help="ランチャーを一時停止しない")
+    ap.add_argument("--no-hires", action="store_true", help="全画素撮影をしない(速いが粗い)")
     a = ap.parse_args()
 
     font, font_path = find_font(16)
@@ -529,20 +628,40 @@ def main():
     keys.flush(1.0)
     print("ready. ENTER=read / ESC=quit")
     reason, frames = "unknown", 0
+    it = latest_item()
+    last_id, next_check = (it["id"] if it else 0), time.time() + 2
     try:
         while True:
             fb.show(pv.frame(cam))
             frames += 1
-            acts = [v for k, v in keys.poll(0.0) if k == "ACT"]
+            ev = keys.poll(0.0)
+            acts = [v for k, v in ev if k == "ACT"]
+            chars = [v.lower() for k, v in ev if k == "CHAR"]
             if "ESC" in acts:
                 reason = "ESC"
                 break
+            if "z" in chars:
+                pv.toggle_zoom()
+            if "q" in chars:
+                fb.show(connect_screen(font, font_s))
+                keys.flush(0.3)
+                while not keys.poll(0.5):
+                    pass
+                keys.flush(0.2)
+                continue
+            if time.time() > next_check:            # スマホ等からの受信を通知
+                next_check = time.time() + 2
+                it = latest_item()
+                if it and it["id"] > last_id:
+                    last_id = it["id"]
+                    if it["source"] != "ocr":
+                        pv.toast = (f"受信 #{it['id']} ({it['source']})", time.time() + 3)
             if "ENTER" not in acts:
                 continue
 
             message(fb, font, "OCR", "読み取り中...")
             t0 = time.time()
-            text = run_ocr(capture_crop(cam), a.lang, a.psm)
+            text = run_ocr(capture_crop(cam, pv.cw, not a.no_hires), a.lang, a.psm)
             ed = Editor(text, font, font_s, time.time() - t0)
             print(f"----- OCR ({ed.elapsed:.1f}s)\n{text}\n-----")
             keys.flush(0.2)

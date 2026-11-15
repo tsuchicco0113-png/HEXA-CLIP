@@ -7,6 +7,7 @@
   czclip get ID           ID指定で出力
   czclip rm ID            削除
   czclip pin              スマホ接続用のURLとPINを表示
+  czclip qr               スマホ接続用のQRコードを端末に表示 (読むだけでログイン)
   czclip logout-all       全端末をログアウト(PINは czclipd --reset-pin で変更)
 """
 import json
@@ -65,6 +66,16 @@ def main(argv):
         print("deleted", file=sys.stderr)
     elif cmd == "pin":
         r = call("GET", "/api/pin")
+        print(f"URL: {r['url']}\nPIN: {r['pin']}")
+    elif cmd == "qr":
+        r = call("GET", "/api/pin")
+        try:
+            import qrcode
+            q = qrcode.QRCode(border=2)
+            q.add_data(r["url"] + "#pin=" + r["pin"])
+            q.print_ascii(invert=True)
+        except ImportError:
+            print("(QR表示には sudo apt install python3-qrcode が必要)")
         print(f"URL: {r['url']}\nPIN: {r['pin']}")
     elif cmd == "logout-all":
         call("POST", "/api/logout_all", {})

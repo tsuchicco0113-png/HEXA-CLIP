@@ -20,7 +20,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.1"
+VERSION = "0.2"
 DATA_DIR = os.path.expanduser(os.environ.get("HEXACLIP_DIR", "~/.local/share/hexaclip"))
 DB_PATH = os.path.join(DATA_DIR, "clip.db")
 PIN_PATH = os.path.join(DATA_DIR, "pin")
@@ -201,7 +201,9 @@ function cp(id){const s=items.find(i=>i.id===id).text;
  else{const ta=document.createElement('textarea');ta.value=s;ta.style.position='fixed';ta.style.opacity='0';
  document.body.appendChild(ta);ta.focus();ta.select();ta.setSelectionRange(0,s.length);
  try{document.execCommand('copy');toast('コピーしました')}catch(e){toast('コピー失敗')}ta.remove()}}
-(async()=>{try{await api('/api/ping');show(true);load(true)}catch(e){}})();
+(async()=>{const m=location.hash.match(/pin=(\d{6})/);
+ if(m){history.replaceState(null,'',location.pathname);$('pin').value=m[1];await login();if($('app').hidden)show(false);return}
+ try{await api('/api/ping');show(true);load(true)}catch(e){}})();
 setInterval(()=>{if(!$('app').hidden)load(false)},3000);
 </script></body></html>
 """
