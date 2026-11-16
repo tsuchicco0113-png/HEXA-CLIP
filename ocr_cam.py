@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HEXA CLIP — CardputerZero 用アプリ (v1.4)
+"""HEXA CLIP — CardputerZero 用アプリ (v1.4.1)
 
 スマホやPCから送ったコード・資料を受け取って、本体で使う (fn+V で打ち込む / ~/clip/ に置く)。
 
@@ -42,7 +42,7 @@ import urllib.request
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-VERSION = "1.4"
+VERSION = "1.4.1"
 LCD_W, LCD_H = 320, 170
 TOP_H, BOT_H = 18, 16                # タブバー / キー案内バー
 MAIN_W, MAIN_H = 1640, 1232          # センサー全画角(2x2ビニング)
@@ -79,6 +79,7 @@ SETTING_DEFS = [
     ("auto_show", "受信したら", [False, True], ["通知だけ", "本文を開く"]),
     ("paste_newline", "fn+V の改行", ["enter", "none"], ["ENTERで打つ", "打たない (1行に)"]),
     ("notify_banner", "ほかのアプリ中に受信", [True, False], ["上に帯を出す", "出さない"]),
+    ("mascot", "ゴマエビちゃん", [True, False], ["表示する", "表示しない"]),
     ("lang", "カメラ: 言語", ["jpn", "jpn+eng", "eng", "code"],
      ["日本語", "日本語+英語", "英語", "コード"]),
     ("hires", "カメラ: 高精細", [True, False], ["ON (小さい文字)", "OFF (速い)"]),
@@ -1163,7 +1164,7 @@ class App:
             latest = next((i for i in self.items if i["id"] == CLIP_LATEST[0]), None)
         happy = time.time() < self.happy_until
         key = (self.home_sel, self.unseen, latest and latest["id"], happy, len(self.items or []),
-               self.status_text(), self.cam is None, self.items is None)
+               self.status_text(), self.cam is None, self.items is None, self.st.get("mascot", True))
         if self.home_cache[0] == key:
             img = self.home_cache[1].copy()
             self.draw_desc(img)
@@ -1194,7 +1195,8 @@ class App:
                 d.text((bx - self.font_t.getlength(n) / 2, by - 7), n, fill=(20, 20, 20), font=self.font_t)
         # 右の説明パネル (ゴマエビちゃんがいれば、その左までに収める)
         x0 = 162
-        mw = max(m.width for m in self.mascot.values()) if self.mascot else 0
+        mascot = self.mascot if self.st.get("mascot", True) else {}
+        mw = max(m.width for m in mascot.values()) if mascot else 0
         right = LCD_W - 6 - (mw + 2 if mw else 0)
         d.text((x0, 22), SCREEN_NAMES[sel], fill=FG, font=self.font_b)
         desc = self.HOME_DESC[sel]
@@ -1217,8 +1219,8 @@ class App:
             d.text((x0 + 5, 95), "まだありません", fill=SUB, font=self.font_s)
         if self.unseen:
             d.text((x0, 124), f"● 新着 {self.unseen}件", fill=(255, 190, 70), font=self.font_bs)
-        if self.mascot:                          # ゴマエビちゃん
-            m = self.mascot["happy" if happy else "idle"]
+        if mascot:                               # ゴマエビちゃん (設定で消せる)
+            m = mascot["happy" if happy else "idle"]
             img.paste(m, (LCD_W - 3 - (mw + m.width) // 2, LCD_H - BOT_H - m.height - 1), m)
         self.home_cache = (key, img.copy())
         self.draw_desc(img)
